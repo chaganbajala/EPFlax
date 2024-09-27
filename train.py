@@ -8,7 +8,7 @@ import pickle
 
 from functools import partial
 
-class Optimizer:
+class optimizer:
     '''
     This define optimizers to do the training.
     Task: get gradient
@@ -26,7 +26,7 @@ class Optimizer:
     def train(self, input_data, target, show_process = False, dynamical_saving = False, suffix = None):
         pass
 
-class Gradient_descent(Optimizer):
+class gradient_descent(optimizer):
     
     @partial(jax.jit, static_argnames=['self'])
     def optimize_step(self, network_params, g_params, learning_rate):
@@ -61,7 +61,7 @@ class Gradient_descent(Optimizer):
                     pickle.dump(costL, f2)
         return costL, paramsL
         
-class Moment_gradient_descent(Gradient_descent):
+class moment_gradient_descent(gradient_descent):
     
     @partial(jax.jit, static_argnames=['self'])
     def optimize_step(self, network_params, g_params, learning_rate, last_grad, r):
@@ -104,7 +104,93 @@ class Moment_gradient_descent(Gradient_descent):
         return costL, paramsL
 
 
-class Optax_optimize(Optimizer):
+class layerwise_gradient_descent(gradient_descent):
+    '''
+    This realize SGD with layerwise learning rate. That is, for different layer the learning rate is different. 
+    '''
+    
+    def __init__(self, grad_method, nn, network_params_0):
+        super().__init__(grad_method, nn, network_params_0)
+        if nn.structure_name !='layered':
+            raise ValueError('The network does not have layer architecture!')
+    
+    def optimize_step(self, network_params, g_params, learning_rate_list):
+        
+        def add_func(x, gx, learning_rate):
+            return x - learning_rate * gx
+                
+        WL, bias = network_params
+        biasL = np.split(bias, self.nn.split_points, axis=-1)
+                
+        g_WL, g_bias = g_params
+        g_biasL = np.split(g_bias, self.nn.split_points, axis=-1)
+                
+        new_WL = jax.tree_map(add_func, WL, g_WL, learning_rate_list)
+        new_biasL = jax.tree_map(add_func, biasL[1:len(biasL)], g_biasL[1:len(biasL)], learning_rate_list)
+        new_bias = np.concatenate((biasL[0], *new_biasL), axis=-1)
+        
+        return new_WL, new_bias
+    
+class layerwise_moment_gradient_descent(moment_gradient_descent):
+    def get_tot_grad(self, g_params, old_params, r):
+        def g_func(g, lg, r):
+            return g + r*lg
+        
+        return jax.tree_map(lambda g, lg: g_func(g, lg, r), g_params, old_params)
+    
+    def layer_wise_update(self, network_params, g_params, learning_rate_list):
+        def add_func(x, gx, learning_rate):
+            return x - learning_rate * gx
+                
+        WL, bias = network_params
+        biasL = np.split(bias, self.nn.split_points, axis=-1)
+                
+        g_WL, g_bias = g_params
+        g_biasL = np.split(g_bias, self.nn.split_points, axis=-1)
+                
+        new_WL = jax.tree_map(add_func, WL, g_WL, learning_rate_list)
+        new_biasL = jax.tree_map(add_func, biasL[1:len(biasL)], g_biasL[1:len(biasL)], learning_rate_list)
+        new_bias = np.concatenate((biasL[0], *new_biasL), axis=-1)
+        
+        return new_WL, new_bias
+    
+    def optimize_step(self, running_params, params_g, learning_rate_list, last_grad, r):
+        tot_g = self.get_tot_grad(params_g, last_grad, r)
+        new_params = self.layer_wise_update(running_params, tot_g, learning_rate_list)
+        
+        return tot_g, new_params
+    
+    def train(self, N_epoch, learning_rate_list, input_data, target, r = 0.9, show_process = False, dynamical_save = False, suffix = None):
+        running_params = self.network_params_0
+        paramsL = [running_params]
+        costL = []
+        def zero_func(x): return 0. * x
+        
+        last_grad = jax.tree_map(zero_func, running_params)
+        
+        for k in range(0, N_epoch):
+            #grad_args = input_data, target, self.nn, running_params, self.grad_method.batch_size, self.grad_method.M_init
+            t0 = time.time()
+            cost, params_g = self.grad_method.grad_func(input_data, target, self.nn, running_params, self.grad_method.batch_size, self.grad_method.M_init)
+            t1 = time.time()
+            last_grad, running_params = self.optimize_step(running_params, params_g, learning_rate_list, last_grad, r)
+            t2 = time.time()
+            
+            paramsL.append(running_params)
+            costL.append(cost)
+            
+            if show_process:
+                print(k, "current cost = ", cost, "thermolization time:", t1-t0, "update time:", t2-t1)
+                
+            if dynamical_save:
+                with open("paramsL_{0}".format(suffix), 'wb') as f1:
+                    pickle.dump(paramsL, f1)
+                with open("costL_{0}".format(suffix), 'wb') as f2:
+                    pickle.dump(costL, f2)
+        return costL, paramsL
+    
+
+class optax_optimize(optimizer):
     '''
     This use optax methods to train the netowrk
     '''
@@ -146,48 +232,33 @@ class Optax_optimize(Optimizer):
         
         return costL, paramsL
     
-    
-#========Methods using layerwise updating=========
 
-class Layerwise_mgd(Moment_gradient_descent):
-    # This implement a moment gradient descent with self-adjusted layerwise update
-    def get_tot_grad(self, g_params, old_params, r):
-        # Compute the drifted gradient with the gradient and the drift
-        def g_func(g, lg, r):
-            return g + r*lg
-        
-        return jax.tree_map(lambda g, lg: g_func(g, lg, r), g_params, old_params)
-    
-    def layer_wise_update(self, params, g_params, learning_rate):
-        
-        def single_update_func(x, gx, learning_rate):
-            return x - learning_rate * gx
-        
-        learning_rate_list = self.nn.get_normalized_learning_rate(params, g_params, learning_rate)
-        new_params = jax.tree_map(single_update_func, params, g_params, learning_rate_list)
-        
-        return new_params
-    
-    def optimize_step(self, running_params, params_g, learning_rate, last_grad, r):
-        tot_g = self.get_tot_grad(params_g, last_grad, r)
-        new_params = self.layer_wise_update(running_params, tot_g, learning_rate)
-        
-        return tot_g, new_params
-    
-    def train(self, N_epoch, learning_rate, input_data, target, r = 0.9, show_process = False, dynamical_save = False, suffix = None):
+class optax_optimize(optimizer):
+    '''
+    This use optax methods to train the netowrk
+    '''
+    def __init__(self, grad_method, nn, network_params_0, optimizer):
+        '''
+        Here optimizer refers to a optax optimizer, optax.adam for example. 
+        '''
+        super().__init__(grad_method, nn, network_params_0)
+        self.optimizer = optimizer
+
+    def train(self, N_epoch, learning_rate, input_data, target, show_process = False, dynamical_save = False, suffix = None):
         running_params = self.network_params_0
         paramsL = [running_params]
         costL = []
-        def zero_func(x): return 0. * x
         
-        last_grad = jax.tree_map(zero_func, running_params)
+        solver = self.optimizer(learning_rate=learning_rate)
+        opt_state = solver.init(running_params)
         
         for k in range(0, N_epoch):
             #grad_args = input_data, target, self.nn, running_params, self.grad_method.batch_size, self.grad_method.M_init
             t0 = time.time()
             cost, params_g = self.grad_method.grad_func(input_data, target, self.nn, running_params, self.grad_method.batch_size, self.grad_method.M_init)
             t1 = time.time()
-            last_grad, running_params = self.optimize_step(running_params, params_g, learning_rate, last_grad, r)
+            updates, opt_state = solver.update(params_g, opt_state, running_params)
+            running_params = optax.apply_updates(running_params, updates)
             t2 = time.time()
             
             paramsL.append(running_params)
@@ -201,8 +272,87 @@ class Layerwise_mgd(Moment_gradient_descent):
                     pickle.dump(paramsL, f1)
                 with open("costL_{0}".format(suffix), 'wb') as f2:
                     pickle.dump(costL, f2)
+        
         return costL, paramsL
     
-class Layerwise_gd(Layerwise_mgd):
-    def train(self, N_epoch, learning_rate, input_data, target, r=0., show_process=False, dynamical_save=False, suffix=None):
-        return super().train(N_epoch, learning_rate, input_data, target, r, show_process, dynamical_save, suffix)
+class self_ad_layerwise_gd(layerwise_gradient_descent):
+        
+    def train(self, N_epoch, learning_rate, input_data, target, r = 0.9, show_process = False, dynamical_save = False, suffix = None):
+        running_params = self.network_params_0
+        paramsL = [running_params]
+        costL = []
+        
+        def norm_ratio(x, gx):
+            return jnp.linalg.norm(x)/jnp.linalg.norm(gx)
+            
+        def list_multiply(L, x):
+            a0 = L[-1]
+            for k in range(0, len(L)):
+                L[k] = L[k]/a0 * x
+            return L
+
+            
+        for k in range(0, N_epoch):
+            #grad_args = input_data, target, self.nn, running_params, self.grad_method.batch_size, self.grad_method.M_init
+            t0 = time.time()
+            cost, params_g = self.grad_method.grad_func(input_data, target, self.nn, running_params, self.grad_method.batch_size, self.grad_method.M_init)
+            t1 = time.time()
+            norm_ratio_list = jax.tree_map(norm_ratio, running_params[0], params_g[0])
+            learning_rate_list = list_multiply(norm_ratio_list, learning_rate)
+            running_params = self.optimize_step(running_params, params_g, learning_rate_list)
+            t2 = time.time()
+            
+            paramsL.append(running_params)
+            costL.append(cost)
+            
+            if show_process:
+                print(k, "current cost = ", cost, "thermolization time:", t1-t0, "update time:", t2-t1)
+                    
+            if dynamical_save:
+                with open("paramsL_{0}".format(suffix), 'wb') as f1:
+                    pickle.dump(paramsL, f1)
+                with open("costL_{0}".format(suffix), 'wb') as f2:
+                    pickle.dump(costL, f2)
+        return costL, paramsL
+    
+class self_ad_layerwise_mgd(layerwise_moment_gradient_descent):
+        
+    def train(self, N_epoch, learning_rate, input_data, target, r = 0.9, show_process = False, dynamical_save = False, suffix = None):
+        running_params = self.network_params_0
+        paramsL = [running_params]
+        costL = []
+        def zero_func(x): return 0. * x
+        last_grad = jax.tree_map(zero_func, running_params)
+        
+        def norm_ratio(x, gx):
+            return jnp.linalg.norm(x)/jnp.linalg.norm(gx)
+            
+        def list_multiply(L, x):
+            a0 = L[-1]
+            for k in range(0, len(L)):
+                L[k] = L[k]/a0 * x
+            return L
+
+            
+        for k in range(0, N_epoch):
+            #grad_args = input_data, target, self.nn, running_params, self.grad_method.batch_size, self.grad_method.M_init
+            t0 = time.time()
+            cost, params_g = self.grad_method.grad_func(input_data, target, self.nn, running_params, self.grad_method.batch_size, self.grad_method.M_init)
+            t1 = time.time()
+            norm_ratio_list = jax.tree_map(norm_ratio, running_params[0], params_g[0])
+            learning_rate_list = list_multiply(norm_ratio_list, learning_rate)
+            last_grad, running_params = self.optimize_step(running_params, params_g, learning_rate_list, last_grad, r)
+            t2 = time.time()
+            
+            paramsL.append(running_params)
+            costL.append(cost)
+            
+            if show_process:
+                print(k, "current cost = ", cost, "thermolization time:", t1-t0, "update time:", t2-t1)
+                    
+            if dynamical_save:
+                with open("paramsL_{0}".format(suffix), 'wb') as f1:
+                    pickle.dump(paramsL, f1)
+                with open("costL_{0}".format(suffix), 'wb') as f2:
+                    pickle.dump(costL, f2)
+        return costL, paramsL

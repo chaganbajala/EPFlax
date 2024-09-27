@@ -1,643 +1,11 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
-import diffrax
 import optax
-import time
-import pickle
-import gc
-# Code for training
+import diffrax
+
 from functools import partial
 
-class Layer:
-    def __init__(self):
-        pass
-    
-    def get_layer_size(self, input_data, former_layer_type):
-        '''
-        Get information of privious layer, determine the shape of the current layer.
-        Return a smaple data, the size and the shape of current layer. 
-        '''
-        pass
-    
-    def get_init_params(self):
-        pass
-    
-    def energy(self):
-        pass
-    
-    def forward_force(self):
-        pass
-    
-    def backward_force(self):
-        pass
-    
-    def get_layer_ratio(self, params, g_params):
-        ratio = {}
-        abs_params = 0.
-        abs_g = 0.
-        
-        for name in params:
-            abs_params = abs_params + jnp.linalg.norm(params[name])**2
-            abs_g = abs_g + jnp.linalg.norm(g_params[name])**2
-        
-            abs_params = jnp.sqrt(abs_params)
-            abs_g = jnp.sqrt(abs_g)
-        
-        for name in params:
-            ratio.update({name:abs_params/abs_g})
-            
-        return ratio
-    
-    def params_norm(self, params):
-        return 0.
-    
-
-class Denselayer(Layer):
-    '''
-    This define a layer with general connectivity
-    '''
-    def __init__(self, output_size, coup_func, bias_func, layer_type='dense'):
-        self.output_size = output_size
-        self.layer_type = layer_type
-        self.bias_func = bias_func
-        self.coup_func = coup_func
-        
-        self.d0_coup = jax.grad(coup_func, 0)
-        self.d1_coup = jax.grad(coup_func, 1)
-        
-        self.vd0_coup = jax.vmap(self.d0_coup, (None, 0))
-        self.md0_coup = jax.vmap(self.vd0_coup, (0, None))
-        
-        self.vd1_coup = jax.vmap(self.d1_coup, (None, 0))
-        self.md1_coup = jax.vmap(self.vd1_coup, (0, None))
-        
-        self.d0_bias = jax.grad(self.bias_func, 0)
-        self.d1_bias = jax.grad(self.bias_func, 1)
-        
-        self.vd0_bias = jax.vmap(self.d0_bias, (0, 0))
-        self.vd1_bias = jax.vmap(self.d1_bias, (0, 0))
-        
-        self.vbias = jax.vmap(self.bias_func, (0,0))
-        self.vcoup = jax.vmap(self.coup_func, (None, 0))
-        self.mcoup = jax.vmap(self.vcoup, (0, None))
-    
-    def get_layer_size(self, input_data, former_layer_type):
-        self.former_layer_type = former_layer_type
-        self.input_size = input_data.flatten().shape[0]
-        return jnp.zeros(self.output_size), self.output_size, '{0}'.format(self.output_size)
-    
-    def get_init_params(self, rng):
-        W = jax.random.normal(rng, [self.input_size, self.output_size]) / jnp.sqrt(self.input_size + self.output_size)
-        h = jnp.zeros(self.output_size)
-        psi = jax.random.uniform(rng, shape=[self.output_size], minval=-jnp.pi, maxval=jnp.pi)
-        return {'weights':W, 'bias field': jnp.asarray([h , psi]).transpose()}
-    
-    def setup(self):
-        if self.former_layer_type == 'dense':
-            self.energy = self.energy_std
-            self.force = self.force_std
-        else:
-            self.energy = self.energy_flatten
-            self.force = self.force_flatten
-    
-    def get_init_state(self, N_data):
-        y0 = np.pi * 2 * (np.random.rand(N_data, self.output_size) - 0.5)
-        return y0
-    
-    def force_std(self, y1, params, y2):
-        # y1: value from last layer
-        # y2: value at this layer
-        W, bias = params['weights'], params['bias field']
-        FF = jnp.sum(W*self.md0_coup(y1, y2), axis=0)
-        BF = jnp.sum(W*self.md1_coup(y1, y2), axis=1)
-        OF = - self.vd0_bias(y2, bias)
-        
-        return FF+OF, BF
-    
-    def energy_std(self, y1, params, y2):
-        W, bias = params['weights'], params['bias field']
-        E0 = jnp.sum(W*self.mcoup(y1, y2))
-        E1 = jnp.sum(self.vbias(y2, bias))
-        return E0+E1
-    
-    def force_flatten(self, y1, params, y2):
-        ny1 = y1.flatten()
-        FF, BF = self.force_std(ny1, params, y2)
-        BF = BF.reshape(*y1.shape)
-        return FF, BF
-    
-    def energy_flatten(self, y1, params, y2):
-        ny1 = y1.flatten()
-        return self.energy_std(ny1, params, y2)
-    
-    def get_layer_ratio(self, params, g_params):
-        ratio = {}
-        r = jnp.linalg.norm(params['weights'])/jnp.linalg.norm(g_params['weights'])
-        ratio.update({'weights': r})
-        ratio.update({'bias field': r})
-        
-        '''
-        ratio.update({
-            'bias field': jnp.sqrt(jnp.square(g_params['bias field'][0]) 
-                                   + jnp.square(params['bias field'][0]) * jnp.square(g_params['bias field'][1])).sum()
-        })
-        '''
-            
-        return ratio
-
-class Conv1D(Denselayer):
-    def __init__(self, output_channel, filter_shape, strides, coup_func, bias_func, layer_type='conv1D'):
-        
-        self.coup_func = coup_func
-        self.bias_func = bias_func
-        
-        self.layer_type = layer_type
-        
-        self.output_channel = output_channel
-        self.filter_shape = filter_shape
-        
-        self.vbias = jax.vmap(self.bias_func, (0,0))
-        
-        self.d0_bias = jax.grad(self.bias_func, 0)
-        self.d1_bias = jax.grad(self.bias_func, 1)
-        
-        self.vd0_bias = jax.vmap(self.d0_bias, (0, 0))
-        self.vd1_bias = jax.vmap(self.d1_bias, (0, 0))
-        
-        self.strides = strides
-        
-    def get_layer_size(self, input_data, former_layer_type):
-        self.former_layer_type = former_layer_type
-        if former_layer_type == 'dense':
-            self.input_channel = 1
-            self.input_size = input_data.shape[0]
-        elif former_layer_type == 'conv1D':
-            self.input_channel, self.input_size = input_data.shape
-        elif former_layer_type == 'conv2D':
-            self.input_channel, self.input_size = input_data.shape[0], input_data.shape[1] * input_data.shape[2]
-            
-        y = np.zeros([self.input_channel, self.input_size])
-        kernel = np.zeros([self.output_channel, self.input_channel, self.filter_shape])
-        y = jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')
-        self.output_size = y.shape[-1]
-        
-        return y[0], self.output_channel * self.output_size, '{0}*{1}'.format(self.output_channel, self.output_size)
-        
-    
-    def get_init_params(self, rng):
-        S = self.input_channel * self.input_size + self.output_channel * self.output_size
-        F = 1/jnp.sqrt(S) * jax.random.normal(rng, shape=(self.output_channel, self.input_channel, self.filter_shape))
-        h = jnp.zeros(self.output_channel)
-        psi = jax.random.uniform(rng, shape=(self.output_channel,), minval=-jnp.pi, maxval=jnp.pi)
-        return {'kernel':F, 'bias field': jnp.asarray([h, psi]).transpose()}
-    
-    def setup(self):
-        if self.former_layer_type == 'conv1D':
-            self.energy = self.energy_std
-        elif self.former_layer_type == 'conv2D':
-            self.energy = self.energy_from_conv2D
-        elif self.former_layer_type == 'dense':
-            self.energy = self.energy_from_dense
-    
-    def get_init_state(self, N_data):
-        return (np.random.rand(N_data, self.output_channel, self.output_size) - 0.5) * np.pi *2
-    
-    #@partial(jax.jit, static_argnames=['self'])
-    def energy_std(self, y1, params, y2):
-        F, bias = jnp.asarray(params['kernel'], dtype=jnp.complex64), params['bias field']
-        E1 = jnp.sum(self.vbias(y2, bias))
-        
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        
-        ny2 = conv_func(jnp.exp(-1j*y1), F)
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0 + E1
-    
-    #@partial(jax.jit, static_argnames=['self'])
-    def energy_from_dense(self, y1, params, y2):
-        F, bias = jnp.asarray(params['kernel'], dtype=jnp.complex64), params['bias field']
-        E1 = jnp.sum(self.vbias(y2, bias))
-        
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        ny1 = y1[None,:]
-        ny2 = conv_func(jnp.exp(-1j*ny1), F)
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0 + E1
-    
-    def energy_from_conv2D(self, y1, params, y2):
-        F, bias = jnp.asarray(params['kernel'], dtype=jnp.complex64), params['bias field']
-        E1 = jnp.sum(self.vbias(y2, bias))
-        
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        
-        ny1 = jax.vmap(jnp.concatenate, (0))(y1)
-        ny2 = conv_func(jnp.exp(-1j*ny1), F)
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0 + E1
-    
-    #@partial(jax.jit, static_argnames=['self'])
-    def force(self, y1, params, y2):
-        #print(y1.shape, y2.shape)
-        FF = -jax.grad(self.energy, 2)(y1, params, y2)
-        BF = -jax.grad(self.energy, 0)(y1, params, y2)
-        
-        return FF, BF
-    
-    def get_layer_ratio(self, params, g_params):
-        ratio = {}
-        r = jnp.linalg.norm(params['kernel'])/jnp.linalg.norm(g_params['kernel'])
-        ratio.update({'kernel': r})
-        ratio.update({'bias field': r})
-        
-        '''
-        ratio.update({
-            'bias field': jnp.sqrt(jnp.square(g_params['bias field'][:,0]) 
-                                   + jnp.square(params['bias field'][:,0]) * jnp.square(g_params['bias field'][:,1])).sum()
-        })
-        '''
-            
-        return ratio
-    
-class Pool1D(Conv1D):
-    def __init__(self, output_channel, filter_shape, strides, coup_func, bias_func, layer_type='conv1D'):
-        super().__init__(output_channel, filter_shape, strides, coup_func, bias_func, layer_type)
-        
-    def get_init_params(self, rng):
-        self.kernel = jnp.ones([self.filter_shape], dtype=jnp.complex64)/self.filter_shape
-        return {'kernel':0.}
-    
-    def energy_std(self, y1, params, y2):
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        
-        ny2 = conv_func(jnp.exp(-1j*y1), self.kernel)
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0
-    
-    def single_pool_func(self, y):
-        return jax.lax.conv(y[None,None,...], self.kernel[None,None,...], window_strides=self.strides ,padding='SAME')[0,...]
-    
-    def pool_func(self, y):
-        return jax.vmap(self.single_pool_func, 0)(y)
-    
-    #@partial(jax.jit, static_argnames=['self'])
-    def energy_from_dense(self, y1, params, y2):
-        ny1 = y1[None,:]
-        ny2 = self.pool_func(jnp.exp(-1j*ny1))
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0
-    
-    def energy_from_conv2D(self, y1, params, y2):
-        
-        ny1 = jax.vmap(jnp.concatenate, (0))(y1)
-        ny2 = self.pool_func(jnp.exp(-1j*ny1))
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0
-    
-    def get_layer_ratio(self, params, g_params):
-        return {'kernel':0.}
-    
-class Conv2D(Conv1D):
-    def __init__(self, output_channel, filter_shape, strides, coup_func, bias_func, layer_type='conv2D'):
-        super().__init__(output_channel, filter_shape, strides, coup_func, bias_func, layer_type)
-        # Note that now self.filter_shape is a list [a, b]
-        
-    def get_layer_size(self, input_data, former_layer_type):
-            
-        self.former_layer_type = former_layer_type
-        if former_layer_type == 'dense':
-            self.input_channel = 1
-            self.input_size = [input_data.shape[0], 1]
-        elif former_layer_type == 'conv1D':
-            self.input_channel, self.input_size = input_data.shape[0], [input_data.shape[1], 1]
-        elif former_layer_type == 'conv2D':
-            self.input_channel, self.input_size = input_data.shape[0], [input_data.shape[1], input_data.shape[2]]
-                
-        y = np.zeros([self.input_channel, *self.input_size])
-        kernel = np.zeros([self.output_channel, self.input_channel, *self.filter_shape])
-        #print(y.shape, kernel.shape)
-        y = jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')
-        self.output_size = [ y.shape[-2], y.shape[-1] ]
-            
-        return y[0], self.output_channel * self.output_size[0] * self.output_size[1], '{0}*{1}*{2}'.format(self.output_channel, *self.output_size)
-        
-    def get_init_params(self, rng):
-        S = self.input_channel * self.input_size[0] * self.input_size[1] + self.output_channel * self.output_size[0] * self.output_size[1]
-        F = 1/jnp.sqrt(S) * jax.random.normal(rng, shape=(self.output_channel, self.input_channel, *self.filter_shape))
-        h = jnp.zeros(self.output_channel)
-        psi = jax.random.uniform(rng, shape=(self.output_channel,), minval=-jnp.pi, maxval=jnp.pi)
-        return {'kernel':F, 'bias field': jnp.asarray([h, psi]).transpose()}
-    
-    def get_init_state(self, N_data):
-        return (np.random.rand(N_data, self.output_channel, *self.output_size) - 0.5) * np.pi *2
-    
-    def setup(self):
-        if self.former_layer_type == 'conv2D':
-            self.energy = self.energy_std
-        elif self.former_layer_type == 'conv1D':
-            self.energy = self.energy_from_conv1D
-        elif self.former_layer_type == 'dense':
-            self.energy = self.energy_from_dense
-            
-    def energy_std(self, y1, params, y2):
-        F, bias = jnp.asarray(params['kernel'], dtype=jnp.complex64), params['bias field']
-        E1 = jnp.sum(self.vbias(y2, bias))
-        
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        
-        ny2 = conv_func(jnp.exp(-1j*y1), F)
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0 + E1
-    
-    def energy_from_dense(self, y1, params, y2):
-        ny1 = y1[None,:,None]
-        return self.energy_std(ny1, params, y2)
-    
-    def energy_from_conv1D(self, y1, params, y2):
-        ny1 = y1[...,None]
-        return self.energy_std(ny1, params, y2)
-    
-    '''
-    def energy_from_conv1D(self, y1, params, y2):
-        F, bias = jnp.asarray(params['kernel'], dtype=jnp.complex64), params['bias field']
-        E1 = jnp.sum(self.vbias(y2, bias))
-        
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        
-        ny1 = y1[..., None]
-        ny2 = conv_func(jnp.exp(-1j*ny1), F)
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0 + E1
-    
-    def energy_from_dense(self, y1, params, y2):
-        F, bias = jnp.asarray(params['kernel'], dtype=jnp.complex64), params['bias field']
-        E1 = jnp.sum(self.vbias(y2, bias))
-        
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        ny1 = y1[None,...,None]
-        ny2 = conv_func(jnp.exp(-1j*ny1), F)
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0 + E1
-    '''
-    
-class Pool2D(Conv2D):
-    def get_init_params(self, rng):
-        self.kernel = jnp.ones([*self.filter_shape], dtype=jnp.complex64)/(self.filter_shape[0] * self.filter_shape[1])
-        return {'kernel':0.}
-    
-    def single_pool_func(self, y):
-        return jax.lax.conv(y[None,None,...], self.kernel[None,None,...], window_strides=self.strides ,padding='SAME')[0,...]
-    
-    def pool_func(self, y):
-        return jax.vmap(self.single_pool_func, 0)(y)
-    
-    def energy_std(self, y1, params, y2):
-        ny2 = self.pool_func(jnp.exp(-1j*y1))
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0
-    
-    #@partial(jax.jit, static_argnames=['self'])
-    def energy_from_dense(self, y1, params, y2):
-        ny1 = y1[None,:]
-        ny2 = self.pool_func(jnp.exp(-1j*ny1))
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0
-    
-    def energy_from_conv1D(self, y1, params, y2):
-        ny1 = jax.vmap(jnp.concatenate, (0))(y1)
-        ny2 = self.pool_func(jnp.exp(-1j*ny1), self.kernel)
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0
-    
-    def get_layer_ratio(self, params, g_params):
-        return {'kernel':0.}
-    
-class Intra_connected(Denselayer):
-    def __init__(self, output_size, coup_func, bias_func, layer_type='dense', ic_type='None', ic_args = None):
-        super().__init__(output_size, coup_func, bias_func, layer_type)
-        '''
-        ic_type refers to "intra connection type". It can be either 'None', 'full', 'graph', 'layer' or 'lattice'. 
-        '''
-        self.ic_type = ic_type
-        self.ic_args = ic_args
-    
-    def get_init_params(self, rng):
-        W = jax.random.normal(rng, [self.input_size, self.output_size]) / jnp.sqrt(self.input_size + self.output_size)
-        h = jnp.zeros(self.output_size)
-        psi = jax.random.uniform(rng, shape=[self.output_size], minval=-jnp.pi, maxval=jnp.pi)
-        
-        if self.ic_type == 'None':
-            return {'weights':W, 'bias field': [h , psi]}
-        elif self.ic_type == 'full':
-            W_in = jax.random.normal(rng, shape = [self.output_size, self.output_size])/jnp.sqrt(self.output_size)
-            return {'weight':W, 'bias field': [h , psi], 'intra coupling': W_in}
-        elif self.ic_type == 'graph':
-            W_in = jax.random.normal(rng, shape = [self.ic_args.shape[0]])/jnp.sqrt(self.output_size)
-            return {'weight':W, 'bias field': [h , psi], 'intra coupling': W_in}
-
-        
-#----------------------------- Transposed Convolution and Unsample Layers ---------------------
-
-class TransConv1D(Conv1D):
-    
-    @staticmethod
-    def transposed_conv(y, kernel, strides, padding='SAME'):
-            # Input tensor: batch size, input channel, dim1, dim2
-            # Input kernel: output channel, input channel, dim1, dim2
-            #print(y.shape)
-            y_run = y.transpose([0,2,1]) # For jax.lax.conv_transpose: batch size, dim1, dim2, input channel
-            kernel_run = kernel.transpose([2,1,0]) # For jax.lax.conv_transpose:  dim1, dim2, input channels, output channels
-            
-
-            # Perform the transposed convolution, output: batch size, dim1, dim2, channel
-            output = jax.lax.conv_transpose(y_run, kernel_run, strides=strides, padding=padding)
-            return output.transpose([0,2,1])
-
-    def get_layer_size(self, input_data, former_layer_type):
-        
-        self.former_layer_type = former_layer_type
-        if former_layer_type == 'dense':
-            self.input_channel = 1
-            self.input_size = input_data.shape[0]
-        elif former_layer_type == 'conv1D':
-            self.input_channel, self.input_size = input_data.shape
-        elif former_layer_type == 'conv2D':
-            self.input_channel, self.input_size = input_data.shape[0], input_data.shape[1] * input_data.shape[2]
-            
-        y = np.zeros([self.input_channel, self.input_size])
-        kernel = np.zeros([self.output_channel, self.input_channel, self.filter_shape])
-        #print(y.shape, kernel.shape)
-        y = self.transposed_conv(y[None,...], kernel, strides=self.strides ,padding='SAME')
-        self.output_size = y.shape[-1]
-        print(y.shape)
-            
-        return y[0], self.output_channel * self.output_size, '{0}*{1}'.format(self.output_channel, self.output_size)
-    
-    def energy_std(self, y1, params, y2):
-        F, bias = jnp.asarray(params['kernel'], dtype=jnp.complex64), params['bias field']
-        E1 = jnp.sum(self.vbias(y2, bias))
-        
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        
-        ny2 = conv_func(jnp.exp(-1j*y2), jnp.flip(F.transpose([1,0,2]), axis=(2)))
-        E0 = - jnp.real(jnp.exp(1j*y1) * ny2).sum()
-        return E0 + E1
-    
-    def energy_from_conv2D(self, y1, params, y2):
-        ny1 = y1[..., None]
-        return self.energy_std(ny1, params, y2)
-    
-    def energy_from_dense(self, y1, params, y2):
-        ny1 = y1[None,...,None]
-        return self.energy_std(ny1, params, y2)
-
-
-class TransConv2D(Conv2D):
-    @staticmethod
-    def transposed_conv(y, kernel, strides, padding='SAME'):
-            # Input tensor: batch size, input channel, dim1, dim2
-            # Input kernel: output channel, input channel, dim1, dim2
-            
-            y_run = y.transpose([0,2,3,1]) # For jax.lax.conv_transpose: batch size, dim1, dim2, input channel
-            kernel_run = kernel.transpose([2,3,1,0]) # For jax.lax.conv_transpose:  dim1, dim2, input channels, output channels
-            
-
-            # Perform the transposed convolution, output: batch size, dim1, dim2, channel
-            output = jax.lax.conv_transpose(y_run, kernel_run, strides=strides, padding=padding)
-            return output.transpose([0,3,1,2])
-    
-    def get_layer_size(self, input_data, former_layer_type):
-            
-        self.former_layer_type = former_layer_type
-        if former_layer_type == 'dense':
-            self.input_channel = 1
-            self.input_size = [input_data.shape[0], 1]
-        elif former_layer_type == 'conv1D':
-            self.input_channel, self.input_size = input_data.shape[0], [input_data.shape[1], 1]
-        elif former_layer_type == 'conv2D':
-            self.input_channel, self.input_size = input_data.shape[0], [input_data.shape[1], input_data.shape[2]]
-                
-        y = np.zeros([self.input_channel, *self.input_size])
-        kernel = np.zeros([self.output_channel, self.input_channel, *self.filter_shape])
-        #print(y.shape, kernel.shape)
-        y = self.transposed_conv(y[None,...], kernel, strides=self.strides ,padding='SAME')
-        self.output_size = [ y.shape[-2], y.shape[-1] ]
-            
-        return y[0], self.output_channel * self.output_size[0] * self.output_size[1], '{0}*{1}*{2}'.format(self.output_channel, *self.output_size)
-    
-    def energy_std(self, y1, params, y2):
-        F, bias = jnp.asarray(params['kernel'], dtype=jnp.complex64), params['bias field']
-        E1 = jnp.sum(self.vbias(y2, bias))
-        
-        def conv_func(y, kernel):
-            return jax.lax.conv(y[None,...], kernel, window_strides=self.strides ,padding='SAME')[0,...]
-        
-        ny2 = conv_func(jnp.exp(-1j*y2), jnp.flip(F.transpose([1,0,2,3]), axis=(2,3)))
-        E0 = - jnp.real(jnp.exp(1j*y1) * ny2).sum()
-        return E0 + E1
-    
-    def energy_from_conv1D(self, y1, params, y2):
-        ny1 = y1[..., None]
-        return self.energy_std(ny1, params, y2)
-    
-    def energy_from_dense(self, y1, params, y2):
-        ny1 = y1[None,...,None]
-        return self.energy_std(ny1, params, y2)
-
-    
-class Unsample1D(TransConv1D):
-    def get_init_params(self, rng):
-        self.kernel = jnp.ones([self.filter_shape], dtype=jnp.complex64)
-        return {'kernel':0.}
-    
-    def single_unsample_func(self, y):
-        def transpose_conv(y, kernel, padding='SAME'):
-            # Input tensor: batch size, input channel, dim1, dim2
-            # Input kernel: output channel, input channel, dim1, dim2
-
-            y_run = y.transpose([0,2,1]) # For jax.lax.conv_transpose: batch size, dim1, dim2, input channel
-            kernel_run = kernel.transpose([2,1,0]) # For jax.lax.conv_transpose:  dim1, dim2, input channels, output channels
-
-            # Perform the transposed convolution, output: batch size, dim1, dim2, channel
-            output = jax.lax.conv_transpose(y_run, kernel_run, strides=self.strides, padding=padding, rhs_dilation=None)
-            return output.transpose([0,2,1])
-        
-        y = y[None, None, ...]
-        #kernel = jnp.ones([1,1,*self.strides])
-        return transpose_conv(y, self.kernel[None,None,...])[0,0,...]
-
-    def unsample_func(self, y):
-        return jax.vmap(self.single_unsample_func, (0))(y)
-    
-    def energy_std(self, y1, params, y2):
-        ny2 = self.unsample_func(jnp.exp(-1j*y1))
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0
-    
-    #@partial(jax.jit, static_argnames=['self'])
-    def energy_from_dense(self, y1, params, y2):
-        ny1 = y1[None,:,None]
-        return self.energy_std(ny1, params, y2)
-    
-    def energy_from_conv1D(self, y1, params, y2):
-        ny1 = y1[...,None]
-        return self.energy_std(ny1, params, y2)
-    
-    def get_layer_ratio(self, params, g_params):
-        return {'kernel':0.}
-    
-    
-class Unsample2D(TransConv2D):
-    def get_init_params(self, rng):
-        self.kernel = jnp.ones([*self.filter_shape], dtype=jnp.complex64)
-        return {'kernel':0.}
-    
-    def single_unsample_func(self, y):
-        def transpose_conv(y, kernel, padding='SAME'):
-            # Input tensor: batch size, input channel, dim1, dim2
-            # Input kernel: output channel, input channel, dim1, dim2
-
-            y_run = y.transpose([0,2,3,1]) # For jax.lax.conv_transpose: batch size, dim1, dim2, input channel
-            kernel_run = kernel.transpose([2,3,1,0]) # For jax.lax.conv_transpose:  dim1, dim2, input channels, output channels
-
-            # Perform the transposed convolution, output: batch size, dim1, dim2, channel
-            output = jax.lax.conv_transpose(y_run, kernel_run, strides=self.strides, padding=padding, rhs_dilation=None)
-            return output.transpose([0,3,1,2])
-        
-        y = y[None, None, ...]
-        #kernel = jnp.ones([1,1,*self.strides])
-        return transpose_conv(y, self.kernel[None,None,...])[0,0,...]
-
-    def unsample_func(self, y):
-        return jax.vmap(self.single_unsample_func, (0))(y)
-    
-    def energy_std(self, y1, params, y2):
-        ny2 = self.unsample_func(jnp.exp(-1j*y1))
-        E0 = - jnp.real(jnp.exp(1j*y2) * ny2).sum()
-        return E0
-    
-    #@partial(jax.jit, static_argnames=['self'])
-    def energy_from_dense(self, y1, params, y2):
-        ny1 = y1[None,:,None]
-        return self.energy_std(ny1, params, y2)
-    
-    def energy_from_conv1D(self, y1, params, y2):
-        ny1 = y1[...,None]
-        return self.energy_std(ny1, params, y2)
-    
-    def get_layer_ratio(self, params, g_params):
-        return {'kernel':0.}
-        
-#===============Module for a Neural Network==============
-    
 class Network:
     '''
     This define a neural network. It should include:
@@ -647,13 +15,28 @@ class Network:
     get_initial_state(input_data): generate a random initial state with specific input_data
     internal_energy(y, network_params): calculate internal energy function
     external_energy(y, target, network_params): calculate external energy
-    internal_force(y, network_params): 
+    internal_force(y, network_paarams): 
     external_force(y, network_params):
     params_derivative(self, y, network_params): 
     '''
     
-    def __init__(self) -> None:
-        pass
+    def __init__(self, opt_params=(1e-3, 1000), run_params=(100, 1e-3, 1e-6), optimizer=None) -> None:
+        #print(opt_params, run_params)
+        self.tol, self.maxtime = opt_params
+        self.runtime, self.rtol, self.atol = run_params
+        self.optimizer = optimizer
+        N_devices = len(jax.devices())
+        if optimizer==None:
+            if N_devices>1:
+                self.thermalize_network = self.pmap_thermalize_ode
+            else:
+                self.thermalize_network = self.thermalize_network_ode
+        else:
+            if N_devices>1:
+                self.thermalize_network = self.pmap_thermalize_opt
+            else:
+                self.thermalize_network = self.thermalize_network_opt
+        
     
     def get_initial_params(self):
         pass
@@ -684,197 +67,6 @@ class Network:
         if batch_size == N_data:
             return np.arange(0, N_data, dtype=np.int32)
         return np.random.randint(0, N_data, batch_size)
-
-    
-class Module(Network):
-    '''
-    This is a DNN module. One need to redefine setup function. 
-    '''
-    def __init__(self, cost_func, run_params=(100, 1e-3, 1e-6), opt_params=(1e-3, 1000), optimizer=None, network_type='general XY', structure_name='dnn'):
-        #Here network_structure = N, input_index, output_index, layer_sizes
-        self.runtime, self.rtol, self.atol = run_params
-        self.tol, self.maxtime = opt_params
-        self.network_type = network_type
-        self.structure_name = structure_name
-        
-        self.layer_order = []
-        self.layers = {}
-        self.params = {}
-
-        self.cost_func = cost_func
-        self.optimizer = optimizer
-    
-    def get_variable_name(self, variable, scope=locals()):
-        for name, value in scope.items():
-            if value is variable:
-                return name
-            
-        for name, value in self.__dict__.items():
-            if value is variable:
-                return name
-        
-    
-    def setup(self):
-        # Here the user need to clarify input_type, layers, name of output layer and the order of the layers
-        self.input_type = None
-        self.l1 = None
-        self.layer_order = ['l1']
-        self.output_name = self.layer_order[-1]
-    
-    def show_hyperparams(self):
-        print("Structure: ", self.structure)
-        print("Number of Nodes: ", self.N_list)
-        print("Total Number of Nodes: ", self.N)
-        if self.optimizer==None:
-            print("Optimizer: ODE")
-        else:
-            print("Optimizer: OPT")
-
-    def get_initial_params(self, rng, input_data):
-        self.setup()
-        N_devices = len(jax.devices())
-        if self.optimizer==None:
-            if N_devices>1:
-                self.thermalize_network = self.pmap_thermalize_ode
-            else:
-                self.thermalize_network = self.thermalize_network_ode
-        else:
-            if N_devices>1:
-                self.thermalize_network = self.pmap_thermalize_opt
-            else:
-                self.thermalize_network = self.thermalize_network_opt
-        
-        for name, value in self.__dict__.items():
-            if hasattr(value, 'layer_type'):
-                self.layers.update({name:value})
-        
-        def prod(xl):
-            p = 1
-            for k in range(0, len(xl)):
-                p = p * xl[k]
-            return p
-        
-        def to_str(xl):
-            y = '{0}'.format(xl[0])
-            for k in range(1, len(xl)):
-                y = y + '*{0}'.format(xl[k])
-            return y
-        
-        input_shape = input_data.shape
-        input_size = prod(input_shape)
-        self.F0 = {'input_data': 0*input_data}
-        self.N = input_size
-        self.N_list = [input_size]
-        self.structure = [to_str(input_shape)]
-        former_layer_type = self.input_type
-        for name in self.layer_order:
-            input_data, N_nodes, layer_structure = self.layers[name].get_layer_size(input_data, former_layer_type)
-            self.params.update({name: self.layers[name].get_init_params(rng)})
-            self.layers[name].setup()
-            self.N = self.N + N_nodes
-            self.N_list.append(N_nodes)
-            self.structure.append(layer_structure)
-            self.F0.update({name:0*input_data})
-            former_layer_type = self.layers[name].layer_type
-        return self.params
-    
-    def get_initial_state(self, input_data):
-        initial_state = {'input_data':input_data}
-        N_data = input_data.shape[0]
-        for name in self.layer_order:
-            current_layer = self.layers[name]
-            state = current_layer.get_init_state(N_data)
-            initial_state.update({name:state})
-        return initial_state
-
-
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def internal_force(self, y, params):
-        y1 = y['input_data']
-        '''
-        def multiply_zero(x):
-            return x*0
-        '''
-        #F = jax.tree_map(multiply_zero, y)
-        #F = {key: np.zeros_like(value) for key, value in y.items()}
-        
-        F = self.F0.copy()
-        last_layer_name = 'input_data'
-        for layer_name in self.layer_order:
-            current_layer = self.layers[layer_name]
-            y2 = y[layer_name]
-            FF, BF= current_layer.force(y1, params[layer_name], y2)
-            F[last_layer_name] += BF * (last_layer_name!='input_data')
-            F[layer_name] += FF
-                
-            last_layer_name = layer_name
-            y1 = y2
-        '''
-        F = {'input_data': 0.*y['input_data']}
-        last_layer_name = 'input_data'
-        for layer_name in self.layer_order:
-            current_layer = self.layers[layer_name]
-            y2 = y[layer_name]
-            FF, BF = current_layer.force(y1, params[layer_name], y2)
-            F[last_layer_name] += BF * (last_layer_name!='input_data')
-            F.update({layer_name: FF})
-                
-            last_layer_name = layer_name
-            y1 = y2
-        '''
-        return F
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def internal_energy(self, y, params):
-        y1 = y['input_data']
-        E = 0.
-        
-        for layer_name in self.layer_order:
-            layer = self.layers[layer_name]
-            y2 = y[layer_name]
-            E += layer.energy(y1, params[layer_name], y2)
-            y1 = y2
-        '''
-        for layer_name, layer in self.__dict__.items():
-            if hasattr(layer, 'layer_type'):
-                y2 = y[layer_name]
-                E += layer.energy(y1, params[layer_name], y2)
-                y1 = y2
-        '''
-        return E
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def distance_function(self, y, target, params):
-        # y is only the output
-        return jnp.sum(1 - jnp.cos(y-target))/2.
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def external_energy(self, y, target):
-        # y is only the output
-        return jnp.sum(jax.vmap(self.cost_func, (0,0))(y, target))
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def external_force(self, y, target, params):
-        return -jax.grad(self.external_energy, argnums=0)(y, target)
-    
-    def convert_to_lnn_params(self, input_data, params):
-        # This transform a structured params into params for a lxynn
-        WL = []
-        biasL = [np.zeros([2, input_data.shape[1]])]
-        for layer_name in self.layer_order:
-            WL.append(params[layer_name]['weights'])
-            biasL.append(np.asarray(params[layer_name]['bias field']))
-        
-        return WL, jnp.concatenate(biasL, axis=1)
-    
-    def merge_y(self, y):
-        yl = []
-        for layer_name, layer in y.items():
-            yl.append(y[layer_name])
-        
-        return jnp.concatenate(yl, axis=1)
-    
     
     #===================Function for Running the Network by Solving ODE===============
     @partial(jax.jit, static_argnames=['self'])
@@ -900,7 +92,11 @@ class Module(Network):
         solution = diffrax.diffeqsolve(eqs, solver, t0=t_span[0], t1=t_span[1], dt0 = None, y0=y0,
                                 stepsize_controller=stepsize_controller, max_steps=10000000)
         
-        return jax.tree_map(jnp.concatenate, solution.ys)
+        L = len(solution.ts)
+        y = solution.ys[L-1,:]
+        #del solution
+
+        return y
 
     
     @partial(jax.jit, static_argnames=['self'])
@@ -909,14 +105,21 @@ class Module(Network):
         return jax.vmap(self.single_free_run, (0,None))(y0, params)
     
     #===================Function for getting equilibriums for training by solving ODE=============
-        
+    
     @partial(jax.jit, static_argnames=['self'])
     def total_force(self, t, y, target, beta, params):
         # Calculate total force for single piece of data
-        F = self.internal_force(y, params)
-        #F1 = beta * self.external_force(y[self.output_name], target, params)
-        F[self.output_name] += beta * self.external_force(y[self.output_name], target, params)
-        return F
+        #F = self.internal_force(y, params) + beta * self.external_force(y, target, params)
+        yt = y[self.network_structure[2]]
+        return self.internal_force(y, params) + beta * self.external_force(y, target, params)
+    '''
+    @partial(jax.jit, static_argnames=['self'])
+    def total_force(self, t, y, target, beta, params):
+        # Calculate total force for single piece of data
+        #F = self.internal_force(y, params) + beta * self.external_force(y, target, params)
+        yt = y[self.network_structure[2]]
+        return self.internal_force(y, params).at[self.network_structure[1]].add(beta * self.external_force(yt, target, params))
+    '''
     
     #@partial(jax.jit, static_argnames=['self', 'nn'])
     def single_run_func(self, y0, target, beta, params):
@@ -940,7 +143,11 @@ class Module(Network):
         solution = diffrax.diffeqsolve(eqs, solver, t0=t_span[0], t1=t_span[1], dt0 = None, y0=y0,
                                 stepsize_controller=stepsize_controller, max_steps=10000000)
         
-        return jax.tree_map(jnp.concatenate, solution.ys)
+        L = len(solution.ts)
+        y = solution.ys[L-1,:]
+        del solution
+
+        return y
     
     @partial(jax.jit, static_argnames=['self'])
     def thermalize_network_ode(self, y0, target, beta, params):
@@ -954,18 +161,14 @@ class Module(Network):
         def leaf_expand(leaf):
             return jnp.tensordot(jnp.ones(n), leaf, 0)
         return jax.tree_map(leaf_expand, tree)
-    
+
     @staticmethod
     def pad_data(y, target, N_devices):
-
+        
         def pad_func(y):
             N_data = y.shape[0]
             N_per = N_data//N_devices
-            pad_width = [(0, N_devices-N_data%N_devices)]
-            for k in range(1, len(y.shape)):
-                pad_width.append((0,0))
-            #print(pad_width)
-            y_pad = jnp.pad(y, pad_width, mode='constant')
+            y_pad = jnp.pad(y, ((0, N_devices-N_data%N_devices),(0,0)), mode='constant')
             return y_pad
 
         def reshape_func(y):
@@ -973,7 +176,7 @@ class Module(Network):
             N_rem  = N_data%N_devices
             N_per = N_data//N_devices
             return y.reshape(N_devices, N_per+int(N_rem==1), *y.shape[1:])
-
+        
         N_data = target.shape[0]
         if N_data%N_devices==0:
             return jax.tree_map(reshape_func, y), reshape_func(target)
@@ -983,39 +186,37 @@ class Module(Network):
             return jax.tree_map(reshape_func, y_pad), reshape_func(target_pad)
 
 
-    from functools import partial
-
     @partial(jax.jit, static_argnames=['self'])
     def pmap_thermalize_ode(self, y0, target, beta, params):
         devices = jax.devices()
         N_devices = len(devices)
-        
+        N_data = y0.shape[0]
+        N_rem = N_data % N_devices
+
         y0_run, target_run = self.pad_data(y0, target, N_devices)
+
         params_run = self.tree_expand(params, N_devices)
         beta_run = self.tree_expand(beta, N_devices)
 
-        y_run = jax.pmap(self.thermalize_network_ode)(y0_run, target_run, beta_run, params_run)
-        def form_data(y, N_data):
-            return jnp.concatenate(y[0:N_data,...])
-        return jax.tree_map(lambda y: form_data(y, target.shape[0]), y_run)
+        #print(y0_run.shape, params[0].shape)
+        y_run = jnp.concatenate(jax.pmap(self.thermalize_network_ode)(y0_run, target_run, beta_run, params_run))
+        return y_run[0:N_data,...]
 
-
+    
     #========Function for getting equilibriums for training by searching with optax========
-    @partial(jax.jit, static_argnames=['self'])
+    
     def total_force_opt(self, y, target, beta, params):
-        F = self.total_force(0., y, target, beta, params)
-        return jax.tree_map(jnp.negative, F)
+        return -self.total_force(0., y, target, beta, params)
     
     #@partial(jax.jit, static_argnames=['self'])
     def single_run_func_opt(self, y0, target, beta, params):
         # This use Optax to find the equilibrium
         opt_state = self.optimizer.init(y0)
-        tol = 1e-2
         tries = 0
         absF = 1.
         y = y0
         
-        #@jax.jit
+        @jax.jit
         def update_func(y, opt_state, target):
             F = self.total_force_opt(y, target, beta, params)
             updates, opt_state = self.optimizer.update(F, opt_state)
@@ -1049,276 +250,1065 @@ class Module(Network):
     def pmap_thermalize_opt(self, y0, target, beta, params):
         devices = jax.devices()
         N_devices = len(devices)
+        N_data = y0.shape[0]
+        N_rem = N_data % N_devices
 
         y0_run, target_run = self.pad_data(y0, target, N_devices)
+
         params_run = self.tree_expand(params, N_devices)
         beta_run = self.tree_expand(beta, N_devices)
 
-        y_run = jax.pmap(self.thermalize_network_opt)(y0_run, target_run, beta_run, params_run)
-        def form_data(y, N_data):
-            return jnp.concatenate(y[0:N_data,...])
-        return jax.tree_map(lambda y: form_data(y, target.shape[0]), y_run)
-
-    #=====================For automatic layerwise updating=================
-    def get_layer_ratio(self, params, g_params):
-        ratio_dict = {}
-        for layer_name in self.layer_order:
-            #print(params[layer_name])
-            #print(g_params[layer_name])
-            #print(self.layers[layer_name].get_layer_ratio(params[layer_name], g_params[layer_name]))
-            ratio_dict.update({layer_name: self.layers[layer_name].get_layer_ratio(params[layer_name], g_params[layer_name])})
-        return ratio_dict
+        #print(y0_run.shape, params[0].shape)
+        y_run = jnp.concatenate(jax.pmap(self.thermalize_network_opt)(y0_run, target_run, beta_run, params_run))
+        return y_run[0:N_data,...]
     
-    def get_normalized_learning_rate(self, params, g_params, learning_rate):
-        ratio_dict = self.get_layer_ratio(params, g_params)
-        normalizer = max(jax.tree_util.tree_leaves(ratio_dict))
-        augment_ratio =  jax.tree_map(lambda x: jnp.divide(x, normalizer), ratio_dict)
-        return jax.tree_map(lambda x: jnp.multiply(x, learning_rate), augment_ratio)
-
-    
-class Autoencoder(Module):
+class Hopfield_Network(Network):
     '''
-    This defines an autoencoder
+    This defines a hopfield-like network with all-to-all connectivity
     '''
-    def setup(self):
-        # One can redefine this function
-        def coup_func(x, y): return -jnp.cos(x-y)
-        def bias_func(x, bias_params): return - bias_params[0] * jnp.cos(x - bias_params[1])
-        self.input_type = 'conv2D'
-        
-        output_channel, filter_shape, strides = 5, [2,2], [2,2]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.c1 = Conv2D(*layer_params)
-        
-        output_channel, filter_shape, strides = 5, [3,3], [3,3]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.pool1 = Pool2D(*layer_params)
-        
-        output_channel, filter_shape, strides = 5, [3,3], [3,3]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.u1 = Unsample2D(*layer_params)
-        
-        output_channel, filter_shape, strides = 1, [2,2], [2,2]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.tc1 = Unsample2D(*layer_params)
-        
-        self.layer_order = ['c1', 'pool1', 'u1', 'tc1']
-        self.output_name = self.layer_order[-1]
-        
-    @partial(jax.jit, static_argnames=['self'])
-    def distance_function(self, y, target, params):
-        # y is only the output
-        slices = tuple(slice(0, dim) for dim in target.shape)
-        return jnp.sum(1 - jnp.cos(y[slices]-target))/2.
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def external_energy(self, y, target):
-        # y is only the output
-        slices = tuple(slice(0, dim) for dim in target.shape)
-        return jnp.sum(jax.vmap(self.cost_func, (0,0))(y[slices], target))
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def external_force(self, y, target, params):
-        return -jax.grad(self.external_energy, argnums=0)(y, target)
     
     
-class Generate_Module(Module):
-    # This help one to define the encoder from an autoencoder.
-    def setup(self, layers, layer_order, input_type):
-        self.input_type = input_type
-        self.layers = layers
-        self.layer_order = layer_order
-        self.output_name = layer_order[-1]
-        
-    def select_equi_func(self):
-        N_devices = len(jax.devices())
-        if self.optimizer==None:
-            if N_devices>1:
-                self.thermalize_network = self.pmap_thermalize_ode
-            else:
-                self.thermalize_network = self.thermalize_network_ode
-        else:
-            if N_devices>1:
-                self.thermalize_network = self.pmap_thermalize_opt
-            else:
-                self.thermalize_network = self.thermalize_network_opt
-        
-    def get_init_params(self, rng, input_type, input_data, layers, layer_order, optimizer, params):
-        self.setup(layers, layer_order, input_type)
-        self.optimizer = optimizer
-        self.select_equi_func()
-        
-        def prod(xl):
-            p = 1
-            for k in range(0, len(xl)):
-                p = p * xl[k]
-            return p
-        
-        def to_str(xl):
-            y = '{0}'.format(xl[0])
-            for k in range(1, len(xl)):
-                y = y + '*{0}'.format(xl[k])
-            return y
-        
-        input_shape = input_data.shape
-        input_size = prod(input_shape)
-        self.F0 = {'input_data': 0*input_data}
-        self.N = input_size
-        self.N_list = [input_size]
-        self.structure = [to_str(input_shape)]
-        former_layer_type = self.input_type
-        k = 0
-        for name in self.layer_order:
-            input_data, N_nodes, layer_structure = self.layers[name].get_layer_size(input_data, former_layer_type)
-            if name in params.keys():
-                self.params.update({name: params[name]})
-            else:
-                self.params.update({name: self.layers[name].get_init_params(rng)})
-            self.layers[name].setup()
-            self.N = self.N + N_nodes
-            self.N_list.append(N_nodes)
-            self.structure.append(layer_structure)
-            self.F0.update({name:0*input_data})
-            former_layer_type = self.layers[name].layer_type
-        return self.params
-
-class Autoencoder(Module):
-    '''
-    This defines an autoencoder
-    '''
-    def setup(self):
-        # One can redefine this function
-        def coup_func(x, y): return -jnp.cos(x-y)
-        def bias_func(x, bias_params): return - bias_params[0] * jnp.cos(x - bias_params[1])
-        self.input_type = 'conv2D'
-        
-        # Define the encoder
-        output_channel, filter_shape, strides = 5, [2,2], [2,2]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.c1 = Conv2D(*layer_params)
-        
-        output_channel, filter_shape, strides = 5, [3,3], [3,3]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.pool1 = Pool2D(*layer_params)
-        
-        # Define the decoder
-        output_channel, filter_shape, strides = 5, [3,3], [3,3]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.u1 = Unsample2D(*layer_params)
-        
-        output_channel, filter_shape, strides = 1, [2,2], [2,2]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.tc1 = Unsample2D(*layer_params)
-        
-        self.layer_order = ['c1', 'pool1', 'u1', 'tc1']
-        self.output_name = self.layer_order[-1]
-        
-        # Define the output
-        layer_params = 10, coup_func, bias_func
-        self.output_layer = Denselayer(*layer_params)
-        
-        self.encoder_order = ['c1', 'pool1']
-        self.inference_order = ['c1', 'pool1', 'output_layer']
-        
-        
-    @partial(jax.jit, static_argnames=['self'])
-    def distance_function(self, y, target, params):
-        # y is only the output
-        slices = tuple(slice(0, dim) for dim in target.shape)
-        return jnp.sum(1 - jnp.cos(y[slices]-target))/2.
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def external_energy(self, y, target):
-        # y is only the output
-        slices = tuple(slice(0, dim) for dim in target.shape)
-        return jnp.sum(jax.vmap(self.cost_func, (0,0))(y[slices], target))
-    
-    @partial(jax.jit, static_argnames=['self'])
-    def external_force(self, y, target, params):
-        return -jax.grad(self.external_energy, argnums=0)(y, target)
-    
-    def generate_encoder(self, rng, params):
-        nn = Generate_Module(self.cost_func)
-        encoder_layers = {}
-        for name in self.encoder_order:
-            encoder_layers.update({name:self.layers[name]})
-        new_params = nn.get_init_params(rng, self.input_type, self.F0['input_data'], encoder_layers, self.encoder_order, self.optimizer, params)
-        return nn, new_params
-    
-    def generate_inference_nn(self, rng, params):
-        nn = Generate_Module(self.cost_func)
-        inf_layers = {}
-        for name in self.inference_order:
-            inf_layers.update({name:self.layers[name]})
-        new_params = nn.get_init_params(rng, self.input_type, self.F0['input_data'], inf_layers, self.inference_order, self.optimizer, params)
-        return nn, new_params
-        
-        
-    
-class My_nn(Module):
-    # This is a template to define a network for inference
-    def __init__(self, cost_func, network_type='general XY', structure_name='dnn'):
-        #Here network_structure = N, input_index, output_index, layer_sizes
-        
+    def __init__(self, network_structure, activation, opt_params=(0.001, 1000), run_params=(100, 0.001, 0.000001), optimizer=None, 
+                 network_type='Hopfield', structure_name='all to all', mask=1.):
+        super().__init__(opt_params, run_params, optimizer)
+        # network_structure = N, input_index, output_index
+        self.activation = activation
         self.network_type = network_type
         self.structure_name = structure_name
+        self.network_structure = network_structure
+        self.d_activation = jax.grad(self.activation, 0)
+        self.mask = mask
+    
+    def get_initial_params(self):
         
-        self.layer_order = []
-        self.layers = {}
-        self.params = {}
+        # get a set of weights and bias. The weight matrix is symmetric. 
+        
+        N = self.network_structure[0]
+        W = 1/np.sqrt(N) * np.random.randn(N, N)
+        W = (W + np.transpose(W))/2
+        
+        bias = np.random.randn(N)
+        
+        return W, bias
+    
+    def get_initial_state(self, input_data):
+        # generate initial state for a set of input data
+        
+        N_data = input_data.shape[0]
+        N, input_index, output_index, activation = self.network_structure
+        
+        y0 = 2 * (np.random.rand(N_data, N) - 0.5)
+        y0[:, input_index] = input_data
+        
+        return y0
+    
+    def get_initial_state_mini_batch(self, input_data, target, batch_size):
+        N_data = input_data.shape[0]
+        N, input_index, output_index, activation = self.network_structure
+        
+        data_ind = np.random.randint(0, N_data, batch_size)
+        y0 = 2 * (np.random.rand(batch_size, N) - 0.5)
+        y0[:, input_index] = input_data[data_ind, :]
+        
+        return y0, target[data_ind, :]
+    
+    def internal_energy(self, y, network_params):
+        W, bias = network_params
+        N = bias.shape[0]
+        
+        E0 = jnp.dot(y, y)/2
+        
+        my = jnp.tensordot(self.activation(y), jnp.ones(N), 0)
+        E1 = - jnp.tensordot(W, my * jnp.transpose(my))/2
+        E2 = - jnp.dot(bias, self.activation(y))
+        
+        return E0 + E1 + E2
 
+    def internal_force(self, y, network_params):
+        W, bias = network_params
+        input_index = self.network_structure[1]
+        #N = bias.shape[0]
+        
+        sy = jax.vmap(self.d_activation,(0))(y)
+        
+        F = y - jnp.dot(jnp.asarray(W), self.activation(y)) * sy - bias * sy
+        F = F.at[input_index].set(0)
+        
+        return -F
+    
+    
+    def distance_function(self, y, target, network_params):
+        W, bias = network_params
+        output_index = self.network_structure[2]
+        dy = y[output_index] - target
+        cost = jnp.dot(dy, dy)/2
+        return cost
+    
+    def external_energy(self, y, target, network_params):
+        
+        W, bias = network_params
+        
+        output_index = self.network_structure[2]
+        dy = y[output_index] - target
+        #cost = jnp.sum(jnp.log(1 - jnp.power(dy, 2)))/2
+        cost = jnp.sum(dy**2)
+        return cost
+    
+    def external_force(self, y, target, network_params):
+        output_index = self.network_structure[2]
+        F = jnp.zeros(y.shape)
+        #F = F.at[output_index].set(-(y[output_index] - target)/(1 - jnp.power(y[output_index]-target, 2)))
+        F = F.at[output_index].set(- y[output_index] + target)
+        
+        return F
+    
+    def params_derivative(self, y, network_params):
+        N = y.shape[0]
+        sy = self.activation(y)
+        my = jnp.tensordot(sy, jnp.ones(N), 0)
+        return -my * jnp.transpose(my), -sy
+
+
+class XY_Network(Network):
+    '''
+    This defince a XY model viewed as an neural network with all-to-all connectivity
+    '''
+    def __init__(self, network_structure, opt_params=(0.001, 1000), run_params=(100, 0.001, 0.000001), optimizer=None, network_type='XY', structure_name='all to all'):
+        #print(opt_params, run_params)
+        super().__init__(opt_params, run_params, optimizer)
+        
+        # network_structure = N, input_index, output_index
+        self.network_type = network_type
+        self.structure_name = structure_name
+        self.network_structure = network_structure
+        self.input_mask = jnp.ones(network_structure[0]).at[network_structure[1]].set(0.)
+        self.output_mask = jnp.zeros(network_structure[0]).at[network_structure[1]].set(1.)
+        
+    
+    #--------------------Initialization of the network-----------------------
+    
+    def get_initial_params(self, seed=None):
+        
+        # get a set of weights and bias. The weight matrix is symmetric. 
+        
+        N = self.network_structure[0]
+        if seed==None:
+            W = 1/np.sqrt(N) * np.random.randn(N, N)
+            W = (W + np.transpose(W))/2
+            bias = np.asarray([0*np.random.randn(N), 2*np.pi*(np.random.rand(N) - 0.5)])
+        else:
+            rng = jax.random.key(seed)
+            W = 1/np.sqrt(N) * jax.random.normal(rng, (N,N))
+            W = 0.5*(W + jnp.transpose(W))
+            bias = jnp.asarray([0*jax.random.normal(rng, (N,)), jax.random.uniform(rng, shape=(N,),minval=-jnp.pi, maxval=jnp.pi)])
+        
+        return W, bias
+    
+    #--------------------Initialization of states network-----------------------
+    
+    def get_initial_state(self, input_data):
+        # generate initial state for a set of input data
+        
+        N_data = input_data.shape[0]
+        N, input_index, output_index = self.network_structure
+        
+        # the initial state follows a uniform distribution over (-\pi, \pi)
+        y0 = 2 * np.pi * (np.random.rand(N_data, N) - 0.5)
+        y0[:, input_index] = input_data
+        
+        return y0
+    
+    def get_initial_state_mini_batch(self, input_data, target, batch_size):
+        #select a random mini-batch of data from total dataset
+        N_data = input_data.shape[0]
+        N, input_index, output_index = self.network_structure[0:3]
+        
+        data_ind = self.get_random_index(N_data, batch_size)
+        y0 = 2 * np.pi * (np.random.rand(batch_size, N) - 0.5)
+        y0[:, input_index] = input_data[data_ind, :]
+        
+        return y0, target[data_ind, :]
+    
+    def get_multiple_init_data(self, input_data, target, M_init, batch_size):
+        # prepare folded mini-batch dataset for multiple random initialization
+        N_data = input_data.shape[0]
+        
+        data_ind = self.get_random_index(N_data, batch_size)
+        
+        mini_input = input_data[data_ind, :]
+        mini_target = target[data_ind, :]
+        
+        batch_input = jnp.concatenate(jnp.tensordot(jnp.ones(M_init), mini_input, 0))
+        batch_target = jnp.concatenate(jnp.tensordot(jnp.ones(M_init), mini_target, 0))
+        
+        return batch_input, batch_target
+    
+    def get_multiple_init_initial_state(self, input_data, target, batch_size, M_init):
+        
+        batch_input, batch_target = self.get_multiple_init_data(input_data, target, M_init, batch_size)
+        y0 = self.get_initial_state(batch_input)
+        return y0, batch_target
+    
+    #----------------------------Dynamics of the network-------------------------------
+    
+    def internal_energy(self, y, network_params):
+        W, bias = network_params
+        N = W.shape[0]
+        
+        my = jnp.tensordot(y, jnp.ones(N), 0)
+        
+        E0 = - jnp.tensordot(W, jnp.cos(my - jnp.transpose(my)))/2
+        
+        E1 = - jnp.dot(bias[0], jnp.cos(y-bias[1]))
+        
+        return E0 + E1
+
+    def internal_force(self, y, network_params):
+        W, bias = network_params
+        input_index = self.network_structure[1]
+        N = W.shape[0]
+        
+        my = jnp.tensordot(y, jnp.ones(N), 0)
+        
+        F = -jnp.sum(W * jnp.sin(my - jnp.transpose(my)), axis=1) - bias[0] * jnp.sin(y - bias[1])
+        #F = F.at[input_index].set(0)
+        F = F * self.input_mask
+        
+        return F
+    
+    def distance_function(self, y, target, network_params):
+        W, bias = network_params
+        output_index = self.network_structure[2]
+        dy = y[output_index] - target
+        cost = jnp.sum(1-jnp.cos(dy))/2
+        return cost
+    
+    
+    def external_energy(self, y, target, network_params):
+        
+        W, bias = network_params
+        
+        output_index = self.network_structure[2]
+        dy = y[output_index] - target
+        cost = -jnp.sum(jnp.log(1 + jnp.cos(dy)))
+        return cost
+    '''
+    
+    def external_energy(self, yt, target, network_params):
+        #output_index = self.network_structure[2]
+        return -jnp.sum(jnp.log(1 + 1e-5 + jnp.cos(yt - target)))
+    '''
+    
+    def external_force(self, y, target, network_params):
+        return -jax.grad(self.external_energy, 0)(y, target, network_params)
+    
+    def params_derivative(self, y, network_params):
+        W, bias = network_params
+        N = y.shape[0]
+
+        # dmy[i,j] = y[i] - y[j]
+        my = jnp.tensordot(y, jnp.ones(N), 0)
+        dmy = my - jnp.transpose(my)
+        
+        # calculate dE/dW
+        g_W = - jnp.cos(dmy)
+        
+        # calculate dE/dh
+        
+        g_bias = jnp.asarray([-jnp.cos(y - bias[1]), -bias[0]*jnp.sin(y - bias[1])])
+        return g_W, g_bias
+    
+class General_XY_Network(XY_Network):
+    """
+    This define a network implementing energy function of arbitrary two-point interaction, bias and cost function
+    coup_func, bias_func: guarantee that it reaches minimum when all the other interactions are screened, e.g., for XY, coup_func = bias_func = -cos(* - *)
+    """
+        
+    def __init__(self, network_structure, coup_func, bias_func, cost_func, opt_params=(0.001, 1000), run_params=(100, 0.001, 0.000001), optimizer=None, 
+                 network_type='general XY', structure_name='all to all'):
+        #print(opt_params, run_params)
+        super().__init__(network_structure, opt_params, run_params, optimizer,
+                         network_type, structure_name)
+        
+        self.coup_func, self.bias_func, self.cost_func = coup_func, bias_func, cost_func
+        self.d0coup_func = jax.grad(coup_func, 0)
+        self.d0bias_func = jax.grad(bias_func, 0)
+        self.d1bias_func = jax.grad(bias_func, 1)
+        self.dcost_func = jax.grad(cost_func, 0)
+    
+    #========================Internal dynamics=========================
+    
+    def internal_energy(self, y, network_params):
+        #W, bias = network_params
+        my = jnp.tile(y, (y.shape[0], 1))
+        #my = jnp.tensordot(y, jnp.ones(N), 0)
+        #m_coup_func = jax.vmap(jax.vmap(self.coup_func, (0, 0)), (0, 0))
+        
+        #v_bias_func = jax.vmap(self.bias_func, (0,0))
+        
+        E0 = jnp.tensordot(network_params[0], jax.vmap(jax.vmap(self.coup_func, (0, 0)), (0, 0))(my, my.T))/2
+        
+        E1 = jnp.dot(network_params[1][0], jax.vmap(self.bias_func, (0,0))(y, network_params[1][1]))
+        
+        return E0 + E1
+    
+    def internal_force(self, y, network_params):
+        return -jax.grad(self.internal_energy, 0)(y, network_params)*self.input_mask
+    
+    #========================External dynamics=====================================
+    
+    def external_energy(self, y, target, network_params):
+        #cost = jnp.sum(jax.vmap(self.cost_func, (0,0))(y[self.network_structure[2]], target))
+        return jnp.sum(jax.vmap(self.cost_func, (0,0))(y[self.network_structure[2]], target))
+    '''
+    
+    def external_energy(self, yt, target, network_params):
+        #cost = jnp.sum(jax.vmap(self.cost_func, (0,0))(y[self.network_structure[2]], target))
+        return jnp.sum(jax.vmap(self.cost_func, (0,0))(yt, target))
+    '''
+    
+    def external_force(self, y, target, network_params):
+        return -jax.grad(self.external_energy, 0)(y, target, network_params)
+    
+    def params_derivative(self, y, network_params):
+        W, bias = network_params
+        N = y.shape[0]
+
+        # dmy[i,j] = y[i] - y[j]
+        my = jnp.tensordot(y, jnp.ones(N), 0)
+        
+        m_coup_func = jax.vmap(jax.vmap(self.coup_func, (0, 0)), (0, 0))
+        v_dbias_func = jax.vmap(self.d1bias_func, (0, 0))
+        v_bias_func = jax.vmap(self.bias_func, (0, 0))
+        
+        # calculate dE/dW
+        g_W = m_coup_func(my, jnp.transpose(my))
+        
+        # calculate dE/dh
+        g_bias = jnp.asarray([v_bias_func(y, bias[1]), bias[0]*v_dbias_func(y, bias[1])])
+        return g_W, g_bias
+    
+    def get_edges(self, params):
+        # In this function we generate the set of edges used for graph
+        W, bias = params
+        N = self.network_structure[0]
+        edges = []
+        graph_W = []
+        for k in range(0,N):
+            for l in range(k+1, N):
+                edges.append([k,l])
+                graph_W.append(W[k,l])
+        
+        graph_params = jnp.asarray(graph_W), bias
+        
+        return jnp.asarray(edges), graph_params
+    
+class Layered_General_XY_Network(General_XY_Network):
+    '''
+    This implement a generall XY network with layered structure
+    '''
+    
+    def __init__(self, network_structure, coup_func, bias_func, cost_func, 
+                 opt_params=(0.001, 1000), run_params=(100, 0.001, 0.000001), optimizer=None,
+                 network_type='general XY', structure_name='layered'):
+        super().__init__(network_structure, coup_func, bias_func, cost_func, opt_params, run_params, optimizer, network_type, structure_name)
+        
+        #Here network_structure = N, input_index, output_index, layer_sizes
+        
+        self.split_points = [network_structure[-1][0]]
+        for k in range(1, len(network_structure[-1])-1):
+            self.split_points.append(self.split_points[-1]+network_structure[-1][k])
+        
+        index_list = [0]
+        for k in range(0, len(network_structure[-1])):
+            index_list.append(index_list[-1]+network_structure[-1][k])
+        
+        self.mask = np.zeros([network_structure[0], network_structure[0]])
+        for k in range(0, len(index_list)-2):
+            self.mask[index_list[k]:index_list[k+1], index_list[k+1]:index_list[k+2]] = 1
+        
+        self.mask = jnp.asarray(self.mask + np.transpose(self.mask))
+        
+        self.layer_shape = jax.tree_map(jnp.zeros, self.network_structure[-1])
+        self.structure_shape = jax.tree_map(jnp.zeros, self.split_points)
+        self.index_list = index_list
+            
+    
+    #==============================================initial netowrk parameters========================
+    def get_initial_params(self, seed=None):
+        
+        # get a set of weights and bias. The weight matrix is symmetric. 
+        
+        N = self.network_structure[0]
+        N_list = self.network_structure[-1]
+        depth = len(N_list)
+        
+        WL = []
+        if seed==None:
+            for k in range(0, depth-1):
+                WL.append( 1/np.sqrt(N_list[k] + N_list[k+1]) * np.random.randn(N_list[k], N_list[k+1]) )
+            
+            bias = np.asarray([0*np.random.randn(N), 2*np.pi*(np.random.rand(N) - 0.5)])
+        else:
+            rng = jax.random.key(seed)
+            for k in range(0, depth-1):
+                WL.append( 1/np.sqrt(N_list[k] + N_list[k+1]) * jax.random.normal(rng, shape=(N_list[k], N_list[k+1])) )
+            
+            bias = jnp.asarray([0*jax.random.normal(rng, shape=(N,)) ,  jax.random.uniform(rng, shape=(N,))])
+        
+        return WL, bias
+    
+    #========================initial states===========================
+    
+    def get_initial_state(self, input_data):
+        # generate initial state for a set of input data
+        
+        N_data = input_data.shape[0]
+        N, input_index, output_index = self.network_structure[0:3]
+        
+        # the initial state follows a uniform distribution over (-\pi, \pi)
+        y0 = 2 * np.pi * (np.random.rand(N_data, N) - 0.5)
+        y0[:, input_index] = input_data
+        
+        return jnp.asarray(y0)
+    
+    #======================calculate interactions between neighbor layers=================
+    
+    def adjacent_energy(self, y1, W, y2):
+        # This calculate \sum W_ij * f(y1_i, y2_j)
+        N1, N2 = y1.shape[0], y2.shape[0]
+        my1 = jnp.tile(y1, (N2, 1))
+        my2 = jnp.tile(y2, (N1, 1))
+        #my1 = jnp.tensordot(y1, jnp.ones(N2), 0)
+        #my2 = jnp.tensordot(jnp.ones(N1), y2, 0)
+        
+        return jnp.tensordot(W, jax.vmap(jax.vmap(self.coup_func, (0,0)), (0,0))(my1.T, my2))
+    
+    
+    def adjacent_forces(self, y1, W, y2):
+        N1, N2 = y1.shape[0], y2.shape[0]
+        my1 = jnp.tile(y1, (N2, 1))
+        my2 = jnp.tile(y2, (N1, 1))
+        #my1 = jnp.tensordot(y1, jnp.ones(N2), 0)
+        #my2 = jnp.tensordot(jnp.ones(N1), y2, 0)
+        
+        # This force acts on y2
+        forward_force = jnp.sum(W * jax.vmap(jax.vmap(self.d0coup_func, (0,0)), (0,0))(my1.T, my2), axis=0)
+        
+        # This force acts on y2
+        backward_force = -jnp.sum(W * jax.vmap(jax.vmap(self.d0coup_func, (0,0)), (0,0))(my1.T, my2), axis=1)
+        
+        return forward_force, backward_force
+    
+    def internal_energy(self, y, network_params):
+        
+        WL, bias = network_params
+        N = bias.shape[1]
+        layer_sizes = self.network_structure[-1]
+        
+        m_coup_func = jax.vmap(jax.vmap(self.coup_func, (0, 0)), (0, 0))  
+        v_bias_func = jax.vmap(self.bias_func, (0,0))
+        
+        yl = jnp.split(y, self.split_points)
+        yl1 = yl.copy()
+        yl2 = yl.copy()
+        
+        del yl1[-1]
+        del yl2[0]
+        
+        E0 = jnp.sum(jnp.asarray(jax.tree_map(self.adjacent_energy, yl1, WL, yl2)))
+        
+        E1 = jnp.dot(bias[0], v_bias_func(y, bias[1]))
+        
+        return E0+E1
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def internal_force(self, y, network_params):
+        #input_index = self.network_structure[1]
+        return -jax.grad(self.internal_energy, 0)(y, network_params)*self.input_mask
+        #return -jax.grad(self.internal_energy, 0)(y, network_params).at[input_index].set(0.)
+    
+    #=================Calculate dynamical terms from external energy============
+    # This part is not interferred by the layer atchitecture and is therefore not necessary to change
+    
+    #=================Calculate parameter derivatives==============
+    def W_derivative(self, y1, y2):
+        N1, N2 = y1.shape[0], y2.shape[0]
+        my1 = jnp.tensordot(y1, jnp.ones(N2), 0)
+        my2 = jnp.tensordot(jnp.ones(N1), y2, 0)
+        
+        return jax.vmap(jax.vmap(self.coup_func, (0,0)), (0,0))(my1, my2)
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def params_derivative(self, y, network_params):
+        WL, bias = network_params
+        N = y.shape[0]
+
+        # dmy[i,j] = y[i] - y[j]
+        my = jnp.tensordot(y, jnp.ones(N), 0)
+        
+        v_dbias_func = jax.vmap(self.d1bias_func, (0, 0))
+        v_bias_func = jax.vmap(self.bias_func, (0, 0))
+        
+        # calculate dE/dW
+        layer_sizes = self.network_structure[-1]
+        
+        yl = jnp.split(y, self.split_points)
+        
+        yl1 = yl.copy()
+        del yl1[-1]
+        
+        yl2 = yl.copy()
+        del yl2[0]
+        
+        g_W = jax.tree_map(self.W_derivative, yl1, yl2)
+        
+        # calculate dE/dh
+        
+        g_bias = jnp.asarray([v_bias_func(y, bias[1]), bias[0]*v_dbias_func(y, bias[1])])
+        return g_W, g_bias
+    
+    #=====================Correlate layered network to a all-to-all network=================
+    def merge_params(self, WL, bias):
+        N = bias.shape[1]
+        depth = len(self.index_list) - 1
+        
+        W = np.zeros([N, N])
+        
+        for n in range(0, depth-1):
+            W[self.index_list[n]:self.index_list[n+1], self.index_list[n+1]:self.index_list[n+2]] = WL[n]
+        
+        W = W + np.transpose(W)
+        
+        return W, bias
+    
+    def get_edges(self, params):
+        WL, bias = params
+        layer_origin = self.split_points.copy()
+        layer_origin.insert(0, 0)
+        edges = []
+        graph_params = []
+        for k in range(0, len(self.index_list)-2):
+            for ind1 in range(self.index_list[k], self.index_list[k+1]):
+                for ind2 in range(self.index_list[k+1], self.index_list[k+2]):
+                    edges.append([ind1, ind2])
+                    graph_params.append(WL[k][ind1-self.index_list[k], ind2-self.index_list[k+1]])
+        
+        graph_params = jnp.asarray(graph_params), bias
+        
+        return jnp.asarray(edges), graph_params
+                    
+            
+
+class Layered_Hopfield_Network(Hopfield_Network):
+    '''
+    This define a general network of layered structure.
+    The network energy function has 2-body interaction, local bias and an external energy. 
+    '''
+    
+    def __init__(self, network_structure, activation, cost_func=None, 
+                 opt_params=(0.001, 1000), run_params=(100, 0.001, 0.000001), optimizer=None, 
+                 network_type='Hopfield', structure_name='layered'):
+        super().__init__(network_structure, activation, opt_params, run_params, optimizer)
+        
+        
+        # network_structure = N, input_index, output_index, layer_sizes
+        self.network_type = network_type
+        self.structure_name = structure_name
+        self.network_structure = network_structure
+        self.activation = activation
+        self.d_activation = jax.grad(self.activation, 0)
+        
         self.cost_func = cost_func
+        self.dcost_func = jax.grad(cost_func, 0)
         
-    def setup(self):
-        def coup_func(x, y): return -jnp.cos(x-y)
-        def bias_func(x, bias_params): return - bias_params[0] * jnp.cos(x - bias_params[1])
-        self.input_type = 'conv2D'
+        self.v_activation = jax.vmap(self.activation, 0)
+        self.vd_activation = jax.vmap(self.d_activation, 0)
         
-        #layer_params = 10, coup_func, bias_func
-        #self.l1 = denselayer(*layer_params)
+        self.split_points = [network_structure[-1][0]]
+        for k in range(1, len(network_structure[-1])-1):
+            self.split_points.append(self.split_points[-1]+network_structure[-1][k])
         
-        output_channel, filter_shape, strides = 3, [4,4], [2,2]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.c1 = Conv2D(output_channel, filter_shape, strides, coup_func, bias_func)
+        index_list = [0]
+        for k in range(0, len(network_structure[-1])):
+            index_list.append(index_list[-1]+network_structure[-1][k])
         
+        self.mask = np.zeros([network_structure[0], network_structure[0]])
+        for k in range(0, len(index_list)-2):
+            self.mask[index_list[k]:index_list[k+1], index_list[k+1]:index_list[k+2]] = 1
         
-        output_channel, filter_shape, strides = 2, [3,3], [3,3]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.pool1 = Pool2D(output_channel, filter_shape, strides, coup_func, bias_func)
+        self.mask = self.mask + np.transpose(self.mask)
         
+        self.layer_shape = jax.tree_map(jnp.zeros, self.network_structure[-1])
+        self.structure_shape = jax.tree_map(jnp.zeros, self.split_points)
+        self.index_list = index_list
+    
+    #=========================initialize network=====================
+    
+    def get_initial_params(self):
         
-        layer_params = 10, coup_func, bias_func
-        self.l1 = Denselayer(*layer_params)
+        # get a set of weights and bias. The weight matrix is symmetric. 
         
-        self.layer_order = ['c1','pool1', 'l1']
-        self.output_name = self.layer_order[-1]
+        N = self.network_structure[0]
+        N_list = self.network_structure[-1]
+        depth = len(N_list)
         
+        WL = []
+        for k in range(0, depth-1):
+            WL.append( 1/np.sqrt(N_list[k] + N_list[k+1]) * np.random.randn(N_list[k], N_list[k+1]) )
         
-class My_AE(Autoencoder):
-    '''
-    This defines an autoencoder
-    '''
-    def setup(self):
-        # One can redefine this function
-        def coup_func(x, y): return -jnp.cos(x-y)
-        def bias_func(x, bias_params): return - bias_params[0] * jnp.cos(x - bias_params[1])
-        self.input_type = 'conv2D'
+        bias = np.asarray(np.random.randn(N))
         
-        output_channel, filter_shape, strides = 5, [2,2], [2,2]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.c1 = Conv2D(*layer_params)
+        return WL, bias
+    
+    def get_initial_state(self, input_data):
+        # generate initial state for a set of input data
         
-        output_channel, filter_shape, strides = 5, [3,3], [3,3]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.pool1 = Pool2D(*layer_params)
+        N_data = input_data.shape[0]
+        N, input_index, output_index = self.network_structure[0:3]
         
-        output_channel, filter_shape, strides = 5, [3,3], [3,3]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.u1 = Unsample2D(*layer_params)
+        # the initial state follows a uniform distribution over (-\pi, \pi)
+        y0 = 2 * (np.random.rand(N_data, N) - 0.5)
+        y0[:, input_index] = input_data
         
-        output_channel, filter_shape, strides = 1, [2,2], [2,2]
-        layer_params = output_channel, filter_shape, strides, coup_func, bias_func
-        self.tc1 = Unsample2D(*layer_params)
+        return y0
+    
+    def get_initial_state_mini_batch(self, input_data, target, batch_size):
+        #select a random mini-batch of data from total dataset
+        N_data = input_data.shape[0]
+        N, input_index, output_index = self.network_structure[0:3]
         
-        self.layer_order = ['c1', 'pool1', 'u1', 'tc1']
-        self.output_name = self.layer_order[-1]
+        data_ind = self.get_random_index(N_data, batch_size)
+        y0 = 2 * np.pi * (np.random.rand(batch_size, N) - 0.5)
+        y0[:, input_index] = input_data[data_ind, :]
+        
+        return y0, target[data_ind, :]
+    
+    def get_multiple_init_data(self, input_data, target, M_init, batch_size):
+        # prepare folded mini-batch dataset for multiple random initialization
+        N_data = input_data.shape[0]
+        
+        data_ind = self.get_random_index(N_data, batch_size)
+        
+        mini_input = input_data[data_ind, :]
+        mini_target = target[data_ind, :]
+        
+        batch_input = jnp.concatenate(jnp.tensordot(jnp.ones(M_init), mini_input, 0))
+        batch_target = jnp.concatenate(jnp.tensordot(jnp.ones(M_init), mini_target, 0))
+        
+        return batch_input, batch_target
+    
+    def get_multiple_init_initial_state(self, input_data, target, batch_size, M_init):
+        
+        batch_input, batch_target = self.get_multiple_init_data(input_data, target, M_init, batch_size)
+        y0 = self.get_initial_state(batch_input)
+        return y0, batch_target
+    
+    #==================calculate internal energy=======================
+    def adjacent_energy(self, y1, W, y2):
+        # This calculate \sum W_ij * r(y1_i)*r(y2_j)
+        return -jnp.dot(self.activation(y1), jnp.dot(W, self.activation(y2)))
+    
+    def adjacent_forces(self, y1, W, y2):
+        forward_force = self.vd_activation(y2) * jnp.dot(self.v_activation(y1), W)
+        backward_force = self.vd_activation(y1) * jnp.dot(W, self.v_activation(y2))
+        return forward_force, backward_force
+    
+    def internal_energy(self, y, network_params):
+        WL, bias = network_params
+        
+        yl = jnp.split(y, self.split_points)
+        
+        yl1 = yl.copy()
+        del yl1[-1]
+        
+        yl2 = yl.copy()
+        del yl2[0]
+
+        E0 = 0.5 * jnp.dot(y, y)        
+        E1 = jnp.sum(jnp.asarray(jax.tree_map(self.adjacent_energy, yl1, WL, yl2)))
+        
+        E2 = -jnp.dot(bias, self.v_activation(y))
+        
+        return E0 + E1 + E2
+    
+    def internal_force(self, y, network_params):
+        WL, bias = network_params
+        N = y.shape[0]
+        input_index = self.network_structure[1]
+        
+        yl = jnp.split(y, self.split_points)
+        
+        yl1 = yl.copy()
+        del yl1[-1]
+        
+        yl2 = yl.copy()
+        del yl2[0]
+        
+        res = jax.tree_map(self.adjacent_forces, yl1, WL, yl2)
+        ff = jnp.concatenate(list(zip(*res))[0])
+        bf = jnp.concatenate(list(zip(*res))[1])
+        
+        F1 = jnp.zeros(N)
+        F2 = jnp.zeros(N)
+        
+        #back and forward force from 2-body interaction
+        F1 = F1.at[jnp.arange(self.split_points[0], N)].set(ff)
+        F2 = F2.at[jnp.arange(0, self.split_points[-1])].set(bf)
+        
+        #force from bias
+        F3 = bias * self.vd_activation(y)
+        
+        F = -y + F1 + F2 + F3
+        F = F.at[input_index].set(0)
+        return F
+    
+    def W_derivative(self, y1, y2):
+        return - jnp.tensordot(self.v_activation(y1), self.v_activation(y2), 0)
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def params_derivative(self, y, network_params):
+        WL, bias = network_params
+        
+        # calculate dE/dW
+        
+        yl = jnp.split(y, self.split_points)
+        
+        yl1 = yl.copy()
+        del yl1[-1]
+        
+        yl2 = yl.copy()
+        del yl2[0]
+        
+        g_W = jax.tree_map(self.W_derivative, yl1, yl2)
+        
+        # calculate dE/dh
+        
+        g_bias = - self.v_activation(y)
+        return g_W, g_bias
+    #=====================External energy and force=====================
+    def external_energy(self, y, target, network_params):
+        output_index = self.network_structure[2]
+        cost = jnp.sum(jax.vmap(self.cost_func, (0,0))(y[output_index], target))
+        return cost
+    
+    def external_force(self, y, target, network_params):
+        output_index = self.network_structure[2]
+        F = jnp.zeros(y.shape)
+        F = F.at[output_index].set(-jax.vmap(self.dcost_func, (0,0))(y[output_index], target))
+        return F
+    
+    #=============Generate an equivalent all-to-all network==============
+    def merge_params(self, WL, bias):
+        N = bias.shape[0]
+        depth = len(self.index_list) - 1
+        
+        W = np.zeros([N, N])
+        
+        for n in range(0, depth-1):
+            W[self.index_list[n]:self.index_list[n+1], self.index_list[n+1]:self.index_list[n+2]] = WL[n]
+        
+        W = W + np.transpose(W)
+        
+        return W, bias
+    
+    def generate_network(self, layer_network_params):
+        network_params = self.merge_params(*layer_network_params)
+        network_structure = self.network_structure[0], self.network_structure[1], self.network_structure[2]
+        return Hopfield_Network(network_structure, self.activation, mask=self.mask), network_params
+    
+    
+class Graph_Network(General_XY_Network):
+    def __init__(self, network_structure, coup_func, bias_func, cost_func, 
+                 opt_params=(0.001, 1000), run_params=(100, 0.001, 0.000001), optimizer=None, 
+                 network_type='general XY', structure_name='graph', edges=jnp.asarray([])):
+        super().__init__(network_structure, coup_func, bias_func, cost_func, 
+                         opt_params, run_params, optimizer, 
+                         network_type, structure_name)
+        # edges is the collection of edges in the graph
+        self.edges = edges
+        self.v_coup = jax.vmap(self.coup_func, (0,0))
+    
+    def get_initial_params(self):
+        N = self.network_structure[0]
+        bias = np.asarray([0*np.random.randn(N), 2*np.pi*(np.random.rand(N) - 0.5)])
+        couplings = np.random.randn(self.edges.shape[0]) / np.sqrt(N)
+        return couplings, bias
+    
+    def single_coupling_energy(self, y, ind1, ind2):
+        return self.coup_func(y[ind1], y[ind2])
+    
+    def coupling(self, y):
+        ind1, ind2 = tuple(jnp.transpose(self.edges))
+        return self.v_coup(y[ind1], y[ind2])
+        #return jax.vmap(self.single_coupling_energy, (None, 0, 0))(y, ind1, ind2)
+    
+    def internal_energy(self, y, network_params):
+        W, bias = network_params
+        
+        E0 = jnp.sum(W*self.coupling(y))
+        
+        E1 = - jnp.dot(bias[0], jnp.cos(y-bias[1]))
+        
+        return E0 + E1
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def internal_force(self, y, network_params):
+        F = - jax.grad(self.internal_energy, 0)(y, network_params)
+        return jnp.multiply(F, self.input_mask)
+    
+    def convert_to_matrix(self, network_params):
+        W, bias = network_params
+        edges_list = self.edges
+        N = self.network_structure[0]
+        matrix_W = jnp.zeros([N,N])
+        matrix_W = matrix_W.at[edges_list[:,0], edges_list[:,1]].set(W)
+        matrix_W = matrix_W + np.transpose(matrix_W)
+        
+        return matrix_W, bias 
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def params_derivative(self, y, network_params):
+        return jax.grad(self.internal_energy, argnums=1)(y, network_params)
+    
+    #===========Functions to modify the structure after define it==========
+    
+    def add_egdes(self, new_edges, params = None):
+        self.edges = jnp.concatenate((self.edges, new_edges), axis=0)
+        if params==None:
+            return self.get_initial_params()
+        else: 
+            couplings, bias = params
+            couplings = jnp.concatenate((couplings, np.random.randn(new_edges.shape[0])), axis=0)
+            
+        return couplings, bias
+    
+class Square_Lattice(General_XY_Network):
+        
+    def __init__(self, network_structure, coup_func, bias_func, cost_func, 
+                 opt_params=(0.001, 1000), run_params=(100, 0.001, 0.000001), optimizer=None, 
+                 network_type='general XY', structure_name='suqare lattice', translation = jnp.asarray([[0,1],[1,0]])):
+        super().__init__(network_structure, coup_func, bias_func, cost_func, 
+                         opt_params, run_params, optimizer, 
+                         network_type, structure_name)
+        # edges is the collection of edges in the graph
+        # network_structure = N, input_index, output_index, lattice_shape
+        self.translation = tuple(translation)
+        self.v_coup = jax.vmap(self.coup_func, (0, 0))
+        
+        self.m_coup = jax.vmap(self.v_coup, (0, 0))
+        
+        self.input_mask = jnp.ones(network_structure[-1])
+        self.input_mask = self.input_mask.at[network_structure[1][:,0], network_structure[1][:,1]].set(0.)
+        
+    def get_initial_params(self):
+        y_test = jnp.zeros(self.network_structure[3])
+        coupling_shape = self.coupling(y_test)
+        
+        def get_random_params(coupling_shape):
+            return np.random.randn(*coupling_shape.shape)/np.sqrt(coupling_shape.size)
+        
+        W = jax.tree_map(get_random_params, coupling_shape)
+        bias = jnp.asarray([jnp.zeros(self.network_structure[3]), (np.random.rand(*self.network_structure[3]) - 0.5)*2*np.pi])
+        
+        return W, bias
+    
+    def get_initial_state(self, input_data):
+        N_data = input_data.shape[0]
+        input_index = jnp.asarray(self.network_structure[1])
+        y0 = jnp.asarray((np.random.rand(N_data, *self.network_structure[3]) - 0.5)*2*np.pi)
+        y0 = y0.at[:,input_index[:,0], input_index[:,1]].set(input_data)
+        return y0
+    
+    
+    def coupling(self, y):
+        # This calculate the couplings of y with clarified lattice structure
+        # y: configuration of the system
+        # v: specific corellation
+        N_row, N_col = self.network_structure[3]
+        coupling_left = self.m_coup(y, jnp.roll(y,shift=[0,-1], axis=(0,1)))[:, 0:N_col-1]
+        coupling_up = self.m_coup(y, jnp.roll(y,shift=[-1,0], axis=(0,1)))[0:N_row-1, :]
+        return coupling_left, coupling_up
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def internal_energy(self, y, network_params):
+        W, bias = network_params
+        
+        E0 = sum(jax.tree_map(jnp.sum, jax.tree_map(jnp.multiply, W, self.coupling(y))))
+        
+        E1 = - jnp.sum(bias[0] * jnp.cos(y-bias[1]))
+        
+        return E0 + E1
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def internal_force(self, y, network_params):
+        F = - jax.grad(self.internal_energy, 0)(y, network_params)
+        return F * self.input_mask
+    
+    def distance_function(self, y, target, network_params):
+        W, bias = network_params
+        output_index = self.network_structure[2]
+        dy = y[output_index[:,0], output_index[:,1]] - target
+        cost = jnp.sum(1-jnp.cos(dy))/2
+        return cost
+    
+    def external_energy(self, y, target, network_params):
+        
+        #W, bias = network_params
+        
+        output_index = self.network_structure[2]
+        cost = jnp.sum(jax.vmap(self.cost_func, (0,0))(y[output_index[:,0], output_index[:,1]], target))
+        return cost
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def external_force(self, y, target, network_params):
+        return - jax.grad(self.external_energy, 0)(y, target, network_params)
+    
+    @partial(jax.jit, static_argnames=['self'])
+    def params_derivative(self, y, network_params):
+        return jax.grad(self.internal_energy, argnums=1)(y, network_params)
+    
+    def get_graph_params(self, params):
+        lattice_shape = self.network_structure[-1]
+        W, bias = params
+        edges = []
+        W_graph = []
+        for k in range(0, lattice_shape[0]):
+            for l in range(0, lattice_shape[1]-1):
+                edges.append([k*lattice_shape[1]+l, k*lattice_shape[1]+l+1])
+                W_graph.append(W[0][k,l])
+                
+        for k in range(0, lattice_shape[0]-1):
+            for l in range(0, lattice_shape[1]):
+                edges.append([k*lattice_shape[1]+l, (k+1)*lattice_shape[1]+l])
+                W_graph.append(W[1][k,l])
+                
+        bias_graph = bias.reshape(2, lattice_shape[0] * lattice_shape[1])        
+        return (jnp.asarray(W_graph), bias_graph), jnp.asarray(edges)
+    
+    def get_matrix_params(self, params):
+        params, edges = self.get_graph_params(params)
+        N = self.network_structure[0]
+        
+        input_index = []
+        for k in range(0, self.network_structure[1].shape[0]):
+            input_index.append(self.network_structure[1][k,0]*self.network_structure[-1][1] + self.network_structure[1][k,1])
+        
+        output_index = []  
+        for k in range(0, self.network_structure[2].shape[0]):
+            output_index.append(self.network_structure[2][k,0]*self.network_structure[-1][1] + self.network_structure[2][k,1])
+            
+        input_index = jnp.asarray(input_index, dtype=jnp.int32)
+        output_index = jnp.asarray(output_index, dtype=jnp.int32)
+        
+        network_structure = N, input_index, output_index
+        graph_nn = Graph_Network(network_structure, self.coup_func, self.bias_func, self.cost_func, edges=edges)
+        
+        return graph_nn.convert_to_matrix(params)
+    
+class Triangular_Lattice(Square_Lattice):
+    def coupling(self, y):
+        N_row, N_col = self.network_structure[3]
+        coupling_left = self.m_coup(y, jnp.roll(y,shift=[0,-1], axis=(0,1)))[:, 0:N_col-1]
+        coupling_up = self.m_coup(y, jnp.roll(y,shift=[-1,0], axis=(0,1)))[0:N_row-1, :]
+        coupling_diag = self.m_coup(y, jnp.roll(y,shift=[-1,-1], axis=(0,1)))[0:N_row-1, 0:N_col-1]
+        return coupling_left, coupling_up, coupling_diag
+    
+    def get_graph_params(self, params):
+        lattice_shape = self.network_structure[-1]
+        W, bias = params
+        edges = []
+        W_graph = []
+        for k in range(0, lattice_shape[0]):
+            for l in range(0, lattice_shape[1]-1):
+                edges.append([k*lattice_shape[1]+l, k*lattice_shape[1]+l+1])
+                W_graph.append(W[0][k,l])
+                
+        for k in range(0, lattice_shape[0]-1):
+            for l in range(0, lattice_shape[1]):
+                edges.append([k*lattice_shape[1]+l, (k+1)*lattice_shape[1]+l])
+                W_graph.append(W[1][k,l])
+        
+        for k in range(0, lattice_shape[0]-1):
+            for l in range(0, lattice_shape[1]-1):
+                edges.append([k*lattice_shape[1]+l, (k+1)*lattice_shape[1]+l+1])
+                W_graph.append(W[2][k,l])
+        
+        bias_graph = bias.reshape(2, lattice_shape[0] * lattice_shape[1])        
+        return (jnp.asarray(W_graph), bias_graph), jnp.asarray(edges)
+    
+class Hybrid_Layered(Layered_General_XY_Network):
+    # This is the layered architecture network allowing assiging intra and cross-layer interaction
+    def __init__(self, network_structure, coup_func, bias_func, cost_func, network_type='general XY', structure_name='layered'):
+        super().__init__(network_structure, coup_func, bias_func, cost_func, network_type, structure_name)
+        self.edges = []
+        
+    def add_egdes(self, edges):
+        # Edges should be either intra-layer or cross-layer coupling
+        # Each edge should have the form [layer number, node number]. 
+        layer_origin = self.split_points.copy()
+        layer_origin.insert(0,0)
+        edge_list = []
+        for ind1, ind2 in edges:
+            print(ind1, ind2, layer_origin)
+            edge_list.append([layer_origin[ind1[0]] + ind1[1], layer_origin[ind2[0]] + ind2[1]])
+            
+        self.edges = jnp.asarray(edge_list)
+        
+    def get_initial_params(self):
+        
+        # get a set of weights and bias. The weight matrix is symmetric. 
+        
+        N = self.network_structure[0]
+        N_list = self.network_structure[-1]
+        depth = len(N_list)
+        
+        WL = []
+        for k in range(0, depth-1):
+            WL.append( 1/np.sqrt(N_list[k] + N_list[k+1]) * np.random.randn(N_list[k], N_list[k+1]) )
+        
+        bias = np.asarray([0*np.random.randn(N), 2*np.pi*(np.random.rand(N) - 0.5)])
+        
+        if self.edges!=[]:
+            self.internal_energy = self.hybrid_energy
+            W_edges = np.random.randn(self.edges.shape[0]) / np.sqrt(self.network_structure[0])
+            return WL, W_edges, bias
+        else:
+            self.internal_energy = self.layer_energy
+            return WL, bias
+    
+    def graph_coupling(self, y):
+        ind1, ind2 = tuple(jnp.transpose(self.edges))
+        return jax.vmap(self.coup_func, (0, 0))(y[ind1], y[ind2])
+    
+    def layer_energy(self, y, network_params):
+        
+        WL, bias = network_params 
+        v_bias_func = jax.vmap(self.bias_func, (0,0))
+        
+        yl = jnp.split(y, self.split_points)
+        
+        yl1 = yl.copy()
+        del yl1[-1]
+        
+        yl2 = yl.copy()
+        del yl2[0]
+        
+        E0 = jnp.sum(jnp.asarray(jax.tree_map(self.adjacent_energy, yl1, WL, yl2)))
+        
+        E1 = jnp.dot(bias[0], v_bias_func(y, bias[1]))
+        
+        return E0+E1
+    
+    def hybrid_energy(self, y, network_params):
+        WL, W_edges, bias = network_params
+        E_layer = self.layer_energy(y, (WL, bias))
+        E_edges = jnp.dot(W_edges, self.graph_coupling(y))
+        return E_layer + E_edges
+    
+    def internal_force(self, y, network_params):
+        F = - jax.grad(self.internal_energy, 0)(y, network_params)
+        input_index = self.network_structure[1]
+        F = F.at[input_index].set(0.)
+        return F
+        

@@ -1,35 +1,30 @@
+import numpy as np
 import jax
 import jax.numpy as jnp
 
-import numpy as np
-import EPFlax.model as lm
+import EPFlax.EPFlat.model as fm
 
-class Layer(lm.Layer):
-    def params_norm(self, params):
-        return jnp.sum(jnp.square(params['weights']))
-    
-class Denselayer(lm.Denselayer, Layer):
-    def params_norm(self, params):
-        return jnp.sum(jnp.square(params['weights']))
-    
-class Conv1D(lm.Conv1D, Denselayer):
-    def params_norm(self, params):
-        return jnp.sum(jnp.square(params['kernel']))
-
-class Conv2D(lm.Conv1D, Denselayer):
-    def params_norm(self, params):
-        return jnp.sum(jnp.square(params['kernel']))
-
-#================================= Network Modules ============================
-class Module(lm.Module):
-    
-    def __init__(self, cost_func, run_params=(100, 1e-3, 1e-6), opt_params=(1e-3, 1000), optimizer=None, network_type='general XY', structure_name='dnn', reg=0.1):
-        super().__init__(cost_func, run_params, opt_params, optimizer, network_type, structure_name)
+class Network(fm.Network):
+    def set_reg(self, reg=0.1):
         self.reg = reg
+        
+    def params_norm(self, params):
+        return 0.
     
     def regularizer(self, params):
-        E = 0.
-        for name in self.layer_order:
-            layer = self.layers[name]
-            E += self.reg * layer.params_norm(params[name])
-        return E
+        return 0.
+    
+class General_XY_Network(fm.General_XY_Network, Network):
+    def params_norm(self, params):
+        return jnp.sum(params[0] * params[0])
+    
+    def regularizer(self, params):
+        return self.reg * self.params_norm(params)
+    
+
+class Layered_General_XY_Network(fm.Layered_General_XY_Network, Network):
+    def params_norm(self, W):
+        return jnp.sum(W * W)
+    
+    def regularizer(self, params):
+        return self.reg * sum([self.params_norm(W) for W in params[0]])
