@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "EPFlax"
+version = "0.1.0"
+description = "Equilibrium Propagation for XY-model energy-based neural networks, built on JAX"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "jax>=0.4.0",
+    "jaxlib>=0.4.0",
+    "optax>=0.1.7",
+    "diffrax>=0.4.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["jupyter", "matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["EPFlax*"]

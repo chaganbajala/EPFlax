@@ -1,0 +1,5 @@
+jax>=0.4.0
+jaxlib>=0.4.0
+optax>=0.1.7
+diffrax>=0.4.0
+numpy>=1.24
