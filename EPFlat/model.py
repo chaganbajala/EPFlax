@@ -82,6 +82,8 @@ class Network:
         # Use 4th Runge Kutta
         solver = diffrax.Tsit5()
         
+        #solver = diffrax.Heun()
+        
         #Use 5th Kvaerno for stiff case
         #solver = diffrax.Kvaerno4()
         
@@ -110,7 +112,7 @@ class Network:
     def total_force(self, t, y, target, beta, params):
         # Calculate total force for single piece of data
         #F = self.internal_force(y, params) + beta * self.external_force(y, target, params)
-        yt = y[self.network_structure[2]]
+        #yt = y[self.network_structure[2]]
         return self.internal_force(y, params) + beta * self.external_force(y, target, params)
     '''
     @partial(jax.jit, static_argnames=['self'])
@@ -160,7 +162,7 @@ class Network:
     def tree_expand(tree, n):
         def leaf_expand(leaf):
             return jnp.tensordot(jnp.ones(n), leaf, 0)
-        return jax.tree_map(leaf_expand, tree)
+        return jax.tree.map(leaf_expand, tree)
 
     @staticmethod
     def pad_data(y, target, N_devices):
@@ -179,11 +181,11 @@ class Network:
         
         N_data = target.shape[0]
         if N_data%N_devices==0:
-            return jax.tree_map(reshape_func, y), reshape_func(target)
+            return jax.tree.map(reshape_func, y), reshape_func(target)
         else:
-            y_pad = jax.tree_map(pad_func, y)
+            y_pad = jax.tree.map(pad_func, y)
             target_pad = pad_func(target)
-            return jax.tree_map(reshape_func, y_pad), reshape_func(target_pad)
+            return jax.tree.map(reshape_func, y_pad), reshape_func(target_pad)
 
 
     @partial(jax.jit, static_argnames=['self'])
@@ -230,7 +232,7 @@ class Network:
         def body_func(vals):
             absF, tries, y, opt_state = vals
             y, opt_state, F = update_func(y, opt_state, target)
-            absF = jnp.sum(jnp.asarray((jax.tree_util.tree_leaves(jax.tree_map(jnp.linalg.norm, F)))))
+            absF = jnp.sum(jnp.asarray((jax.tree_util.tree_leaves(jax.tree.map(jnp.linalg.norm, F)))))
             tries += 1
             return absF, tries, y, opt_state
         
@@ -399,13 +401,30 @@ class XY_Network(Network):
         else:
             rng = jax.random.key(seed)
             W = 1/np.sqrt(N) * jax.random.normal(rng, (N,N))
-            W = 0.5*(W + jnp.transpose(W))
+            W = 0.5*(W + jnp.transpose(W)) * (1. - jnp.eye(W.shape))
             bias = jnp.asarray([0*jax.random.normal(rng, (N,)), jax.random.uniform(rng, shape=(N,),minval=-jnp.pi, maxval=jnp.pi)])
         
         return W, bias
     
     #--------------------Initialization of states network-----------------------
     
+    def get_initial_state(self, input_data, seed=None):
+        if seed==None:
+            N_data = input_data.shape[0]
+            N, input_index, output_index = self.network_structure
+            y0 = 2 * np.pi * (np.random.rand(N_data, N) - 0.5)
+            y0[:, input_index] = input_data
+            return y0
+        
+        
+        else:
+            rng = jax.random.key(seed)
+            N_data = input_data.shape[0]
+            input_index = jnp.asarray(self.network_structure[1])
+            y0 = jax.random.uniform(rng, shape=(N_data, self.network_structure[0]), minval=-jnp.pi, maxval=jnp.pi)
+            y0 = y0.at[:,input_index].set(input_data)
+            return y0
+    '''
     def get_initial_state(self, input_data):
         # generate initial state for a set of input data
         
@@ -417,6 +436,7 @@ class XY_Network(Network):
         y0[:, input_index] = input_data
         
         return y0
+    '''
     
     def get_initial_state_mini_batch(self, input_data, target, batch_size):
         #select a random mini-batch of data from total dataset
@@ -530,6 +550,7 @@ class General_XY_Network(XY_Network):
         super().__init__(network_structure, opt_params, run_params, optimizer,
                          network_type, structure_name)
         
+        # network_structure = N, input_index, output_index
         self.coup_func, self.bias_func, self.cost_func = coup_func, bias_func, cost_func
         self.d0coup_func = jax.grad(coup_func, 0)
         self.d0bias_func = jax.grad(bias_func, 0)
@@ -629,8 +650,8 @@ class Layered_General_XY_Network(General_XY_Network):
         
         self.mask = jnp.asarray(self.mask + np.transpose(self.mask))
         
-        self.layer_shape = jax.tree_map(jnp.zeros, self.network_structure[-1])
-        self.structure_shape = jax.tree_map(jnp.zeros, self.split_points)
+        self.layer_shape = jax.tree.map(jnp.zeros, self.network_structure[-1])
+        self.structure_shape = jax.tree.map(jnp.zeros, self.split_points)
         self.index_list = index_list
             
     
@@ -660,15 +681,20 @@ class Layered_General_XY_Network(General_XY_Network):
     
     #========================initial states===========================
     
-    def get_initial_state(self, input_data):
+    def get_initial_state(self, input_data, seed=None):
         # generate initial state for a set of input data
         
         N_data = input_data.shape[0]
         N, input_index, output_index = self.network_structure[0:3]
         
-        # the initial state follows a uniform distribution over (-\pi, \pi)
-        y0 = 2 * np.pi * (np.random.rand(N_data, N) - 0.5)
-        y0[:, input_index] = input_data
+        if seed==None:
+            # the initial state follows a uniform distribution over (-\pi, \pi)
+            y0 = 2 * np.pi * (np.random.rand(N_data, N) - 0.5)
+            y0[:, input_index] = input_data
+        else: 
+            rng = jax.random.PRNGKey(seed)
+            y0 = jax.random.uniform(rng, shape=(N_data, N), minval=-jnp.pi, maxval=jnp.pi)
+            y0 = y0.at[:, input_index].set(input_data)
         
         return jnp.asarray(y0)
     
@@ -716,7 +742,7 @@ class Layered_General_XY_Network(General_XY_Network):
         del yl1[-1]
         del yl2[0]
         
-        E0 = jnp.sum(jnp.asarray(jax.tree_map(self.adjacent_energy, yl1, WL, yl2)))
+        E0 = jnp.sum(jnp.asarray(jax.tree.map(self.adjacent_energy, yl1, WL, yl2)))
         
         E1 = jnp.dot(bias[0], v_bias_func(y, bias[1]))
         
@@ -761,7 +787,7 @@ class Layered_General_XY_Network(General_XY_Network):
         yl2 = yl.copy()
         del yl2[0]
         
-        g_W = jax.tree_map(self.W_derivative, yl1, yl2)
+        g_W = jax.tree.map(self.W_derivative, yl1, yl2)
         
         # calculate dE/dh
         
@@ -798,7 +824,7 @@ class Layered_General_XY_Network(General_XY_Network):
         
         return jnp.asarray(edges), graph_params
                     
-            
+           
 
 class Layered_Hopfield_Network(Hopfield_Network):
     '''
@@ -839,8 +865,8 @@ class Layered_Hopfield_Network(Hopfield_Network):
         
         self.mask = self.mask + np.transpose(self.mask)
         
-        self.layer_shape = jax.tree_map(jnp.zeros, self.network_structure[-1])
-        self.structure_shape = jax.tree_map(jnp.zeros, self.split_points)
+        self.layer_shape = jax.tree.map(jnp.zeros, self.network_structure[-1])
+        self.structure_shape = jax.tree.map(jnp.zeros, self.split_points)
         self.index_list = index_list
     
     #=========================initialize network=====================
@@ -926,7 +952,7 @@ class Layered_Hopfield_Network(Hopfield_Network):
         del yl2[0]
 
         E0 = 0.5 * jnp.dot(y, y)        
-        E1 = jnp.sum(jnp.asarray(jax.tree_map(self.adjacent_energy, yl1, WL, yl2)))
+        E1 = jnp.sum(jnp.asarray(jax.tree.map(self.adjacent_energy, yl1, WL, yl2)))
         
         E2 = -jnp.dot(bias, self.v_activation(y))
         
@@ -945,7 +971,7 @@ class Layered_Hopfield_Network(Hopfield_Network):
         yl2 = yl.copy()
         del yl2[0]
         
-        res = jax.tree_map(self.adjacent_forces, yl1, WL, yl2)
+        res = jax.tree.map(self.adjacent_forces, yl1, WL, yl2)
         ff = jnp.concatenate(list(zip(*res))[0])
         bf = jnp.concatenate(list(zip(*res))[1])
         
@@ -980,7 +1006,7 @@ class Layered_Hopfield_Network(Hopfield_Network):
         yl2 = yl.copy()
         del yl2[0]
         
-        g_W = jax.tree_map(self.W_derivative, yl1, yl2)
+        g_W = jax.tree.map(self.W_derivative, yl1, yl2)
         
         # calculate dE/dh
         
@@ -1026,14 +1052,21 @@ class Graph_Network(General_XY_Network):
                          opt_params, run_params, optimizer, 
                          network_type, structure_name)
         # edges is the collection of edges in the graph
+        # network_structure = N, input_index, output_index
         self.edges = edges
         self.v_coup = jax.vmap(self.coup_func, (0,0))
     
-    def get_initial_params(self):
+    def get_initial_params(self, seed = None):
         N = self.network_structure[0]
-        bias = np.asarray([0*np.random.randn(N), 2*np.pi*(np.random.rand(N) - 0.5)])
-        couplings = np.random.randn(self.edges.shape[0]) / np.sqrt(N)
-        return couplings, bias
+        if seed==None:
+            bias = np.asarray([0*np.random.randn(N), 2*np.pi*(np.random.rand(N) - 0.5)])
+            couplings = np.random.randn(self.edges.shape[0]) / np.sqrt(N)
+            return couplings, bias
+        else:
+            rng = jax.random.PRNGKey(seed)
+            bias = jnp.asarray([jnp.zeros(N), jax.random.uniform(rng, shape=(N,), minval=-jnp.pi, maxval=jnp.pi)])
+            couplings = jax.random.normal(rng, shape=(self.edges.shape[0],)) / jnp.sqrt(N)
+            return couplings, bias
     
     def single_coupling_energy(self, y, ind1, ind2):
         return self.coup_func(y[ind1], y[ind2])
@@ -1046,7 +1079,7 @@ class Graph_Network(General_XY_Network):
     def internal_energy(self, y, network_params):
         W, bias = network_params
         
-        E0 = jnp.sum(W*self.coupling(y))
+        E0 = - jnp.sum(W*self.coupling(y))
         
         E1 = - jnp.dot(bias[0], jnp.cos(y-bias[1]))
         
@@ -1099,26 +1132,48 @@ class Square_Lattice(General_XY_Network):
         self.m_coup = jax.vmap(self.v_coup, (0, 0))
         
         self.input_mask = jnp.ones(network_structure[-1])
-        self.input_mask = self.input_mask.at[network_structure[1][:,0], network_structure[1][:,1]].set(0.)
+        if network_structure[1].shape[0]>0:
+            self.input_mask = self.input_mask.at[network_structure[1][:,0], network_structure[1][:,1]].set(0.)
         
-    def get_initial_params(self):
+    def get_initial_params(self, seed=None):
         y_test = jnp.zeros(self.network_structure[3])
         coupling_shape = self.coupling(y_test)
         
-        def get_random_params(coupling_shape):
-            return np.random.randn(*coupling_shape.shape)/np.sqrt(coupling_shape.size)
+        if seed==None:
+            def get_random_params(coupling_shape):
+                return np.random.randn(*coupling_shape.shape)/np.sqrt(coupling_shape.size)
+            
+            W = jax.tree.map(get_random_params, coupling_shape)
+            bias = jnp.asarray([jnp.zeros(self.network_structure[3]), (np.random.rand(*self.network_structure[3]) - 0.5)*2*np.pi])
+            
+            return W, bias
         
-        W = jax.tree_map(get_random_params, coupling_shape)
-        bias = jnp.asarray([jnp.zeros(self.network_structure[3]), (np.random.rand(*self.network_structure[3]) - 0.5)*2*np.pi])
-        
-        return W, bias
+        else:
+            rng = jax.random.PRNGKey(seed)
+            rng_W, rng_bias = jax.random.split(rng)
+            def get_random_params(coupling_shape):
+                return jax.random.normal(rng_W, shape=coupling_shape.shape) / jnp.sqrt(coupling_shape.size)
+            
+            W = jax.tree.map(get_random_params, coupling_shape)
+            bias = jnp.asarray([jnp.zeros(self.network_structure[3]), jax.random.uniform(rng_bias, shape=self.network_structure[3], minval=-jnp.pi, maxval=jnp.pi)])
+            
+            return W, bias
     
-    def get_initial_state(self, input_data):
-        N_data = input_data.shape[0]
-        input_index = jnp.asarray(self.network_structure[1])
-        y0 = jnp.asarray((np.random.rand(N_data, *self.network_structure[3]) - 0.5)*2*np.pi)
-        y0 = y0.at[:,input_index[:,0], input_index[:,1]].set(input_data)
-        return y0
+    def get_initial_state(self, input_data, seed=None):
+        if seed==None:
+            N_data = input_data.shape[0]
+            input_index = jnp.asarray(self.network_structure[1])
+            y0 = jnp.asarray((np.random.rand(N_data, *self.network_structure[3]) - 0.5)*2*np.pi)
+            y0 = y0.at[:,input_index[:,0], input_index[:,1]].set(input_data)
+            return y0
+        
+        else:
+            rng = jax.random.key(seed)
+            N_data = input_data.shape[0]
+            input_index = jnp.asarray(self.network_structure[1])
+            y0 = jax.random.uniform(rng, shape=(N_data, *self.network_structure[3]), minval=-jnp.pi, maxval=jnp.pi)
+            y0 = y0.at[:,input_index[:,0], input_index[:,1]].set(input_data)
+            return y0
     
     
     def coupling(self, y):
@@ -1130,23 +1185,23 @@ class Square_Lattice(General_XY_Network):
         coupling_up = self.m_coup(y, jnp.roll(y,shift=[-1,0], axis=(0,1)))[0:N_row-1, :]
         return coupling_left, coupling_up
     
-    @partial(jax.jit, static_argnames=['self'])
+    #@partial(jax.jit, static_argnames=['self'])
     def internal_energy(self, y, network_params):
         W, bias = network_params
         
-        E0 = sum(jax.tree_map(jnp.sum, jax.tree_map(jnp.multiply, W, self.coupling(y))))
+        E0 = sum(jax.tree.map(jnp.sum, jax.tree.map(jnp.multiply, W, self.coupling(y))))
         
         E1 = - jnp.sum(bias[0] * jnp.cos(y-bias[1]))
         
         return E0 + E1
     
-    @partial(jax.jit, static_argnames=['self'])
+    #@partial(jax.jit, static_argnames=['self'])
     def internal_force(self, y, network_params):
         F = - jax.grad(self.internal_energy, 0)(y, network_params)
         return F * self.input_mask
     
     def distance_function(self, y, target, network_params):
-        W, bias = network_params
+        #W, bias = network_params
         output_index = self.network_structure[2]
         dy = y[output_index[:,0], output_index[:,1]] - target
         cost = jnp.sum(1-jnp.cos(dy))/2
@@ -1294,7 +1349,7 @@ class Hybrid_Layered(Layered_General_XY_Network):
         yl2 = yl.copy()
         del yl2[0]
         
-        E0 = jnp.sum(jnp.asarray(jax.tree_map(self.adjacent_energy, yl1, WL, yl2)))
+        E0 = jnp.sum(jnp.asarray(jax.tree.map(self.adjacent_energy, yl1, WL, yl2)))
         
         E1 = jnp.dot(bias[0], v_bias_func(y, bias[1]))
         
