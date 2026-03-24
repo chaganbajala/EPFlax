@@ -79,36 +79,7 @@ Extends `model.py` layer and module classes with L2 weight regularization via a 
 
 ## Quick Start
 
-```python
-import jax
-import jax.numpy as jnp
-import EPFlax.model as lm
-import EPFlax.grad as eg
-import EPFlax.train as et
-
-# 1. Define coupling and bias functions
-def coup_func(x, y): return jnp.cos(x - y)
-def bias_func(x, b): return b[0] * jnp.cos(x - b[1])
-
-# 2. Build a network module
-nn = lm.Module(cost_func=my_cost_func)
-nn.add_layer('hidden', lm.Denselayer(64, coup_func, bias_func))
-nn.add_layer('output', lm.Denselayer(10, coup_func, bias_func))
-nn.compile(input_data_sample)
-params0 = nn.get_initial_params(jax.random.PRNGKey(0))
-
-# 3. Set up EP gradient method
-grad_method = eg.EP_grad(
-    grad_params=(beta, runtime, rtol, atol),
-    sample_args=('mini_batch', batch_size, M_init)
-)
-
-# 4. Train
-optimizer = et.Optax_optimize(grad_method, nn, params0, optax.adam)
-costL, paramsL = optimizer.train(N_epoch=500, learning_rate=1e-3,
-                                  input_data=X_train, target=y_train,
-                                  show_process=True)
-```
+(There should be a python code showing a sample implementation)
 
 ## Background
 
