@@ -16,7 +16,7 @@ EPFlax/
 ├── grad.py         # Equilibrium Propagation gradient computation
 ├── train.py        # Optimizer classes for training
 ├── reg_model.py    # Regularized model extensions
-├── EPFlat/         # Simplified flat-structure network variant
+├── EPFlat/         # Define a network with arbitraty coupling topology on a plane
 │   ├── model.py
 │   ├── grad.py
 │   └── train.py
@@ -51,7 +51,7 @@ Network classes:
 | Class | Description |
 |---|---|
 | `EP_grad` | Core EP gradient estimator (free phase vs. nudged phase) |
-| `Reg_EP_grad` | EP gradient with L2 regularization |
+| `Reg_EP_grad` | EP gradient with L2 regularization on couplings |
 
 Supports three sampling strategies: `full`, `mini_batch`, and `random_init_mini_batch`.
 
