@@ -44,7 +44,7 @@ Network classes:
 | `Network` | Abstract base network (ODE/optimizer-based thermalization) |
 | `Module` | Modular network built by stacking layers |
 | `Autoencoder` | Encoder-decoder network for generative tasks |
-| `Generate_Module` | Network variant for generative modelling |
+| `Generate_Module` | Used for extract subnetworks viewed as encoder and decoder from a network with the form of an autoencoder |
 
 ### `grad.py` — Equilibrium Propagation Gradients
 
