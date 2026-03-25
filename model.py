@@ -97,7 +97,7 @@ class Layer:
 
     Optional override:
         get_layer_ratio — used for per-layer learning-rate normalisation.
-        params_norm     — regularisation helper (default: 0).
+        params_norm     — used also for layerwise choice of learning rate. 
     """
 
     def __init__(self):
@@ -185,14 +185,14 @@ class Layer:
 # =============================================================================
 
 class Denselayer(Layer):
-    """Fully-connected XY-model layer.
+    """Fully-connected layer.
 
     Each neuron pair (i in layer l-1, j in layer l) interacts via:
 
         E_ij = W_{ij} · coup_func(θ^{l-1}_i, θ^l_j)
 
     For the default choice coup_func(a, b) = -cos(a - b) this is the standard
-    XY ferromagnetic coupling.  A bias field [h_j, ψ_j] acts on every output
+    XY coupling.  A bias field [h_j, ψ_j] acts on every output
     neuron j:
 
         E_bias_j = bias_func(θ^l_j, [h_j, ψ_j])  =  -h_j · cos(θ^l_j - ψ_j)
@@ -257,7 +257,7 @@ class Denselayer(Layer):
             former_layer_type (str): Type tag of the preceding layer.
 
         Returns:
-            tuple: (zero_output, output_size, structure_string)
+            tuple: (zero_output: shape of output in the current layer, output_size: size of current layer, structure_string: size in string)
         """
         self.former_layer_type = former_layer_type
         # Dense layer always flattens its input regardless of spatial structure
@@ -276,7 +276,7 @@ class Denselayer(Layer):
 
         Returns:
             dict: {'weights': W, 'bias field': array of shape (output_size, 2)}
-                  where column 0 is h and column 1 is ψ.
+                  where column 0 is h and column 1 is the angle.
         """
         W = jax.random.normal(rng, [self.input_size, self.output_size]) / jnp.sqrt(self.input_size + self.output_size)
         h = jnp.zeros(self.output_size)                                            # zero initial bias magnitude
@@ -561,7 +561,7 @@ class Conv1D(Denselayer):
             self.energy = self.energy_from_dense
 
     def get_init_state(self, N_data):
-        """Return random initial angles for all output neurons.
+        """Return random initial angles for all neurons.
 
         Args:
             N_data (int): Batch size.
@@ -576,12 +576,6 @@ class Conv1D(Denselayer):
 
         The energy is computed in the complex domain:
             E = -Re[ e^{i·y2} · conv(e^{-i·y1}, F) ]  +  Σ_c bias_func(y2_c, bias_c)
-
-        Here:
-          exp(-1j*y1) maps input angles to input phasors.
-          F is cast to complex64 so the convolution is complex-valued.
-          exp(1j*y2) * ny2 gives the elementwise inner product in the complex plane.
-          Taking -Re[...] recovers the XY cos(θ_j - θ_i) structure.
 
         Args:
             y1     (jnp.ndarray): Input angles, shape (in_channels, L_in).
@@ -2162,7 +2156,7 @@ class Module(Network):
         return -jax.grad(self.external_energy, argnums=0)(y, target)
 
     def convert_to_lnn_params(self, input_data, params):
-        """Convert structured params to a flat list suitable for LXY-NN.
+        """Convert structured params to a flat list suitable for Layered NN.
 
         Args:
             input_data (jnp.ndarray): Sample input (used to build bias offset).
@@ -2621,8 +2615,8 @@ class Autoencoder(Module):
     as the input.
 
     The internal energy is naturally split into two halves:
-      encoder half:  E_enc = E(input → c1) + E(c1 → pool1)
-      decoder half:  E_dec = E(pool1 → u1) + E(u1 → tc1)
+      encoder half:  E_enc
+      decoder half:  E_dec
 
     Both halves contribute equally to the total internal energy used in EP
     (this symmetry is baked into the layer_order list).
@@ -2633,7 +2627,7 @@ class Autoencoder(Module):
     """
 
     def setup(self):
-        """Define the encoder–decoder architecture.
+        """Define the encoder–decoder of certain architecture.
 
         Override this method in subclasses to change the layer configuration.
         """
